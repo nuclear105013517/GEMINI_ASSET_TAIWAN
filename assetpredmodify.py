@@ -162,7 +162,19 @@ with st.sidebar:
     p_inv_ratio = st.slider("可支配資金投資比例 (%)", 0, 100, 70, 5) / 100.0
     p_return = st.number_input("預期年化報酬率 (μ) (%)", value=7.0, step=0.5) / 100.0
     p_volatility = st.number_input("年化波動率 (σ) (%)", value=15.0, step=0.5, help="S&P500 歷史波動率約為 15-18%") / 100.0
-    p_paths = st.selectbox("蒙地卡羅路徑數", [100, 500, 1000, 5000], index=1)
+    
+    # 【修改重點】：為路徑數新增了 help 參數與預設值
+    p_paths = st.selectbox(
+        "蒙地卡羅路徑數", 
+        options=[100, 500, 1000, 5000], 
+        index=2, 
+        help="""模擬的「平行宇宙」數量，代表未來市場不同的隨機走勢。
+        
+        💡 建議設定：
+        • 100 ~ 500：適合快速拖曳參數，體會資產變化（效能極高）。
+        • 1000：兼顧網頁流暢度與統計顯著性的最佳平衡（推薦預設值）。
+        • 5000：適合最終決策時的極端壓力測試（運算時間會稍長）。"""
+    )
     
     st.markdown("---")
     st.subheader("🏠 購屋資產互換")
@@ -225,7 +237,6 @@ fig_nw.add_trace(go.Scatter(x=df_res['年齡'], y=df_res['純租投資_中位數
 
 # 純租無投資 (灰色實線)
 fig_nw.add_trace(go.Scatter(x=df_res['年齡'], y=df_res['純租_無投資'], mode='lines', line=dict(color='#8E8E93', width=3), name='純租+純儲蓄'))
-
 
 fig_nw.update_layout(
     plot_bgcolor='white', paper_bgcolor='white', hovermode="x unified",
