@@ -28,10 +28,7 @@ class LifeFinancialALM:
         return net_cashflow_renting, rent, inflation_mult
 
     def generate_mortgage_schedule(self):
-        """
-        計算房貸攤還：利用封閉解 (Closed-form Solution) 進行徹底的 NumPy 向量化，
-        消除原先的 O(Years * 12) 巢狀迴圈效能瓶頸。
-        """
+        """計算房貸攤還：利用封閉解 (Closed-form Solution) 進行徹底的 NumPy 向量化"""
         loan_amount = self.p['房價'] - self.p['頭期款']
         annual_rate = self.p['房貸利率']
         total_years = self.p['房貸年限']
@@ -51,7 +48,10 @@ class LifeFinancialALM:
         grace_yearly_pmt = loan_amount * annual_rate
         
         # 2. 攤還期現金流 (年金現值公式)
-        monthly_pmt = loan_amount * (monthly_rate * (1 + monthly_rate)**rem_months) / ((1 + monthly_rate)**rem_months - 1)
+        if rem_months > 0:
+            monthly_pmt = loan_amount * (monthly_rate * (1 + monthly_rate)**rem_months) / ((1 + monthly_rate)**rem_months - 1)
+        else:
+            monthly_pmt = 0
         amort_yearly_pmt = monthly_pmt * 12
         
         # 利用陣列索引向量化填入現金流
@@ -108,19 +108,21 @@ class LifeFinancialALM:
     def simulate_wealth_mc(self, cashflows, is_investing=True):
         """量化蒙地卡羅投資模擬 (處理破產路徑依賴與嚴謹的GBM隨機過程)"""
         wealth = np.zeros((self.N_years, self.N_paths))
-        wealth[0, :] = self.p['起始資金'] + cashflows[0]
+        
+        # 【修正核心】：Day-1 的初始財富池 = 初始流動資金 + 現有投資部位 + 第一年的淨現金流
+        wealth[0, :] = self.p['起始資金'] + self.p['現有投資'] + cashflows[0]
         
         if is_investing:
             Z = np.random.normal(0, 1, (self.N_years, self.N_paths))
             mu = self.p['預期報酬'] * self.p['投資比例']
             sigma = self.p['預期波動率'] * self.p['投資比例']
             
-            # 修正：精確的幾何布朗運動 (GBM) 離散化解 (避免算術近似導致跌破 -100%)
+            # 精確的幾何布朗運動 (GBM) 離散化解
             portfolio_returns = np.exp((mu - (sigma**2)/2) + sigma * Z) - 1
         else:
             portfolio_returns = np.zeros((self.N_years, self.N_paths))
         
-        # 由於存在破產條件 (Non-linear Path Dependency)，此處必須保留時間遞迴，但運算已極簡化
+        # 時間遞迴計算資產路徑
         for t in range(1, self.N_years):
             cf = cashflows[t]
             prev_wealth = wealth[t-1, :]
@@ -180,7 +182,6 @@ class LifeFinancialALM:
             paths_subset = net_worth_paths[:end_idx+1, :]
             peaks = np.maximum.accumulate(paths_subset, axis=0)
             
-            # 優化：避免除以零或負數的數學邊界錯誤
             with np.errstate(divide='ignore', invalid='ignore'):
                 drawdowns = np.where(peaks > 0, (paths_subset - peaks) / peaks, 0)
             
@@ -208,7 +209,11 @@ with st.sidebar:
     st.subheader("👤 基本財務")
     p_age = st.number_input("目前年齡", min_value=20, max_value=60, value=30, step=1)
     p_retire = st.number_input("預計退休年齡", min_value=40, max_value=80, value=65, step=1)
-    p_capital = st.number_input("起始流動資金 (萬元)", min_value=0, value=200, step=10)
+    
+    # 【新增參數】：將起始資金與現有投資部位分開設定，方便使用者釐清流動性來源
+    p_capital = st.number_input("起始流動資金 (萬元)", min_value=0, value=100, step=10, help="目前的現金存款")
+    p_exist_invest = st.number_input("目前已投資部位 (萬元)", min_value=0, value=100, step=10, help="目前已經投入股市/基金等市場的資產")
+    
     p_inflation = st.number_input("年通膨/薪資成長率 (%)", min_value=0.0, value=2.0, step=0.5) / 100.0
     
     p_salary = st.number_input("目前平均月薪 (萬元)", min_value=0.0, value=8.0, step=0.5)
@@ -217,7 +222,7 @@ with st.sidebar:
     
     st.markdown("---")
     st.subheader("📊 投資市場動態")
-    p_inv_ratio = st.slider("可支配資金投資比例 (%)", 0, 100, 70, 5) / 100.0
+    p_inv_ratio = st.slider("總資金配置投資比例 (%)", 0, 100, 70, 5) / 100.0
     p_return = st.number_input("預期年化報酬率 (μ) (%)", value=7.0, step=0.5) / 100.0
     p_volatility = st.number_input("年化波動率 (σ) (%)", value=15.0, step=0.5) / 100.0
     p_paths = st.selectbox("蒙地卡羅路徑數", options=[100, 500, 1000, 5000, 10000], index=2)
@@ -237,8 +242,9 @@ with st.sidebar:
     p_loan_rate = st.number_input("房貸利率 (%)", value=2.1, step=0.1) / 100.0
     p_house_appr = st.number_input("房產年增值率 (%)", value=1.5, step=0.1) / 100.0
 
+# 【新增映射】：確保參數被送入核心引擎
 params = {
-    '起始年齡': p_age, '退休年齡': p_retire, '起始資金': p_capital, '通膨率': p_inflation,
+    '起始年齡': p_age, '退休年齡': p_retire, '起始資金': p_capital, '現有投資': p_exist_invest, '通膨率': p_inflation,
     '月薪': p_salary, '月開銷': p_expense, '月房租': p_rent,
     '投資比例': p_inv_ratio, '預期報酬': p_return, '預期波動率': p_volatility, '模擬路徑數': p_paths,
     '買房年齡': p_buy_age, '房價': p_house_price, '頭期款': p_down_pmt,
@@ -249,7 +255,7 @@ model = LifeFinancialALM(params)
 df_res, mort_pmt, ruin_probs, mdd_stats = model.run()
 
 # ==========================================
-# 3. 儀表板與數據視覺化
+# 3. 儀表板與數據視覺化 (不改變原架構)
 # ==========================================
 target_age = 65 if 65 in df_res.index else df_res.index[-1]
 target_data = df_res.loc[target_age]
