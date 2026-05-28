@@ -8,6 +8,9 @@ import numpy as np
 # 1. 核心量化模型：資產負債與蒙地卡羅引擎
 # ==========================================
 class LifeFinancialALM:
+    """
+    機構級資產負債管理與蒙地卡羅模擬引擎
+    """
     def __init__(self, params):
         self.p = params
         self.N_years = 101 - self.p['起始年齡']
@@ -25,44 +28,51 @@ class LifeFinancialALM:
         return net_cashflow_renting, rent, inflation_mult
 
     def generate_mortgage_schedule(self):
-        """計算房貸攤還 (支援寬限期精算邏輯)"""
+        """
+        計算房貸攤還：利用封閉解 (Closed-form Solution) 進行徹底的 NumPy 向量化，
+        消除原先的 O(Years * 12) 巢狀迴圈效能瓶頸。
+        """
         loan_amount = self.p['房價'] - self.p['頭期款']
         annual_rate = self.p['房貸利率']
         total_years = self.p['房貸年限']
         grace_years = self.p['寬限期']
         
-        # 例外防呆
-        if loan_amount <= 0 or total_years <= 0:
-            return np.zeros(self.N_years), np.zeros(self.N_years), 0
-            
         yearly_pmt = np.zeros(self.N_years)
         remaining_principal = np.zeros(self.N_years)
-        current_principal = loan_amount
         
-        # 精算每月利率與期數
+        if loan_amount <= 0 or total_years <= 0:
+            return yearly_pmt, remaining_principal, 0
+            
         monthly_rate = annual_rate / 12
+        amort_years = total_years - grace_years
+        rem_months = amort_years * 12
         
-        for y in range(total_years):
-            if y < self.N_years:  # 確保不超出生命表邊界
-                if y < grace_years:
-                    # 寬限期：僅繳利息
-                    pmt_year = current_principal * annual_rate
-                    yearly_pmt[y] = pmt_year
-                    remaining_principal[y] = current_principal
-                else:
-                    # 攤還期：本息平均攤還
-                    rem_months = (total_years - grace_years) * 12
-                    monthly_pmt = current_principal * (monthly_rate * (1 + monthly_rate)**rem_months) / ((1 + monthly_rate)**rem_months - 1)
-                    
-                    # 計算該年年底的剩餘本金 (扣除12個月的本金攤還)
-                    for m in range(12):
-                        interest = current_principal * monthly_rate
-                        principal_paid = monthly_pmt - interest
-                        current_principal -= principal_paid
-                        
-                    yearly_pmt[y] = monthly_pmt * 12
-                    remaining_principal[y] = max(current_principal, 0) # 避免浮點數誤差
-                    
+        # 1. 寬限期現金流與本金 (純繳息)
+        grace_yearly_pmt = loan_amount * annual_rate
+        
+        # 2. 攤還期現金流 (年金現值公式)
+        monthly_pmt = loan_amount * (monthly_rate * (1 + monthly_rate)**rem_months) / ((1 + monthly_rate)**rem_months - 1)
+        amort_yearly_pmt = monthly_pmt * 12
+        
+        # 利用陣列索引向量化填入現金流
+        valid_grace = min(grace_years, self.N_years)
+        valid_total = min(total_years, self.N_years)
+        
+        if valid_grace > 0:
+            yearly_pmt[:valid_grace] = grace_yearly_pmt
+            remaining_principal[:valid_grace] = loan_amount
+            
+        if valid_total > valid_grace:
+            yearly_pmt[valid_grace:valid_total] = amort_yearly_pmt
+            
+            # 攤還期各年年底的剩餘期數 (月)
+            y_idx = np.arange(1, valid_total - valid_grace + 1)
+            months_left = rem_months - (y_idx * 12)
+            
+            # 剩餘本金封閉解： PMT * [1 - (1+r)^-M] / r
+            rem_prin = monthly_pmt * (1 - (1 + monthly_rate)**(-months_left)) / monthly_rate
+            remaining_principal[valid_grace:valid_total] = np.clip(rem_prin, 0, None) # 避免浮點數誤差導致負數
+
         return yearly_pmt, remaining_principal, loan_amount
 
     def build_scenarios(self):
@@ -78,13 +88,11 @@ class LifeFinancialALM:
         if self.p['買房年齡'] in self.ages:
             idx_buy = np.where(self.ages == self.p['買房年齡'])[0][0]
             idx_end = min(idx_buy + self.p['房貸年限'], self.N_years)
+            loan_length = idx_end - idx_buy
             
-            # 買房現金流重構：扣頭期款、停付房租、繳房貸
+            # 現金流重構
             cf_buying[idx_buy] -= self.p['頭期款']
             cf_buying[idx_buy:] += rent_array[idx_buy:] 
-            
-            # 動態匹配房貸繳納陣列長度
-            loan_length = idx_end - idx_buy
             cf_buying[idx_buy:idx_end] -= yearly_mortgage_pmt[:loan_length]
             
             # 房產市值 (幾何增值)
@@ -92,31 +100,31 @@ class LifeFinancialALM:
             appreciation = (1 + self.p['房產年增值']) ** np.clip(years_owned, 0, None)
             property_value[idx_buy:] = self.p['房價'] * appreciation[idx_buy:]
             
-            # 房貸餘額對齊
+            # 房貸餘額
             mortgage_balance[idx_buy:idx_end] = remaining_principal[:loan_length]
 
         return cf_renting, cf_buying, property_value, mortgage_balance, yearly_mortgage_pmt
 
     def simulate_wealth_mc(self, cashflows, is_investing=True):
-        """量化蒙地卡羅投資模擬 (處理破產路徑依賴)"""
+        """量化蒙地卡羅投資模擬 (處理破產路徑依賴與嚴謹的GBM隨機過程)"""
         wealth = np.zeros((self.N_years, self.N_paths))
         wealth[0, :] = self.p['起始資金'] + cashflows[0]
         
         if is_investing:
-            # 預先生成隨機變數以優化效能
             Z = np.random.normal(0, 1, (self.N_years, self.N_paths))
             mu = self.p['預期報酬'] * self.p['投資比例']
             sigma = self.p['預期波動率'] * self.p['投資比例']
-            # 使用幾何布朗運動 (Geometric Brownian Motion) 的離散近似
-            portfolio_returns = mu - (sigma**2)/2 + sigma * Z
+            
+            # 修正：精確的幾何布朗運動 (GBM) 離散化解 (避免算術近似導致跌破 -100%)
+            portfolio_returns = np.exp((mu - (sigma**2)/2) + sigma * Z) - 1
         else:
             portfolio_returns = np.zeros((self.N_years, self.N_paths))
         
+        # 由於存在破產條件 (Non-linear Path Dependency)，此處必須保留時間遞迴，但運算已極簡化
         for t in range(1, self.N_years):
             cf = cashflows[t]
             prev_wealth = wealth[t-1, :]
             
-            # 破產截斷條件：若流動資產>0則享受市場複利，否則僅累加現金流
             wealth[t, :] = np.where(
                 prev_wealth > 0,
                 prev_wealth * (1 + portfolio_returns[t, :]) + cf,
@@ -128,18 +136,17 @@ class LifeFinancialALM:
         """執行完整模型並回傳統計結果與風險指標"""
         cf_rent, cf_buy, prop_val, mort_bal, mort_pmt = self.build_scenarios()
         
-        # 1. 執行蒙地卡羅模擬 (有投資)
+        # 1. 蒙地卡羅模擬
         mc_rent_invest = self.simulate_wealth_mc(cf_rent, is_investing=True)
         mc_buy_invest = self.simulate_wealth_mc(cf_buy, is_investing=True)
         
-        # 2. 執行確定性計算 (無投資)
+        # 2. 確定性計算
         det_rent_no_invest = self.simulate_wealth_mc(cf_rent, is_investing=False)[:, 0]
         det_buy_no_invest = self.simulate_wealth_mc(cf_buy, is_investing=False)[:, 0]
         
-        # 計算買房情境的「總淨資產」路徑
+        # 總淨資產
         mc_buy_net_worth = mc_buy_invest + prop_val[:, None] - mort_bal[:, None]
         
-        # 彙整總淨資產結果
         results = pd.DataFrame(index=self.ages)
         results['年齡'] = self.ages
         results['純租_現金流'] = cf_rent
@@ -156,11 +163,10 @@ class LifeFinancialALM:
         results['買房投資_P5'] = np.percentile(mc_buy_net_worth, 5, axis=1)
         results['買房投資_P95'] = np.percentile(mc_buy_net_worth, 95, axis=1)
         
-        # 3. 風險統計指標 (路徑依賴的破產機率與最大回撤)
+        # 3. 風險指標 (Max Drawdown & Probability of Ruin)
         target_age = 65 if 65 in self.ages else self.ages[-1]
         idx_target = np.where(self.ages == target_age)[0][0]
         
-        # 嚴謹的路徑依賴破產判定：只要在目標年齡前，流動資產曾 < 0 即視為破產
         ruin_probs = {
             'buy_inv_65': np.mean(np.any(mc_buy_invest[:idx_target+1, :] < 0, axis=0)) * 100,
             'rent_inv_65': np.mean(np.any(mc_rent_invest[:idx_target+1, :] < 0, axis=0)) * 100,
@@ -170,11 +176,14 @@ class LifeFinancialALM:
             'buy_inv_end': np.mean(np.any(mc_buy_invest < 0, axis=0)) * 100
         }
         
-        # 計算 65 歲前總淨資產的最大回撤率 (Max Drawdown, MDD) 中位數
         def calc_median_mdd(net_worth_paths, end_idx):
             paths_subset = net_worth_paths[:end_idx+1, :]
             peaks = np.maximum.accumulate(paths_subset, axis=0)
-            drawdowns = (paths_subset - peaks) / np.where(peaks <= 0, 1e-9, peaks)
+            
+            # 優化：避免除以零或負數的數學邊界錯誤
+            with np.errstate(divide='ignore', invalid='ignore'):
+                drawdowns = np.where(peaks > 0, (paths_subset - peaks) / peaks, 0)
+            
             drawdowns = np.clip(drawdowns, -1, 0)
             max_drawdowns = np.min(drawdowns, axis=0)
             return abs(np.median(max_drawdowns)) * 100
@@ -190,8 +199,8 @@ class LifeFinancialALM:
 # 2. 頁面設定與 UI 渲染
 # ==========================================
 st.set_page_config(page_title="量化人生財務模擬器", page_icon="📈", layout="wide")
-st.title("📈 量化人生財務模擬器 (Monte Carlo Edition)")
-st.markdown("融合**精算科學**與**蒙地卡羅模擬**，真實呈現純儲蓄與市場投資在不同決策下的量化邊界。")
+st.title("📈 量化人生財務模擬器 (Institutional Monte Carlo Edition)")
+st.markdown("融合**精算科學 (Actuarial Science)**與**隨機微積分 (Stochastic Calculus)**，真實呈現市場動態中的量化邊界。")
 
 with st.sidebar:
     st.header("⚙️ 量化參數設定")
@@ -211,7 +220,7 @@ with st.sidebar:
     p_inv_ratio = st.slider("可支配資金投資比例 (%)", 0, 100, 70, 5) / 100.0
     p_return = st.number_input("預期年化報酬率 (μ) (%)", value=7.0, step=0.5) / 100.0
     p_volatility = st.number_input("年化波動率 (σ) (%)", value=15.0, step=0.5) / 100.0
-    p_paths = st.selectbox("蒙地卡羅路徑數", options=[100, 500, 1000, 5000], index=2)
+    p_paths = st.selectbox("蒙地卡羅路徑數", options=[100, 500, 1000, 5000, 10000], index=2)
     
     st.markdown("---")
     st.subheader("🏠 購屋與貸款模組")
@@ -245,9 +254,8 @@ df_res, mort_pmt, ruin_probs, mdd_stats = model.run()
 target_age = 65 if 65 in df_res.index else df_res.index[-1]
 target_data = df_res.loc[target_age]
 
-st.subheader(f"📊 {target_age}歲 財務健康度總覽 (淨資產與破產風險)")
+st.subheader(f"📊 {target_age}歲 財務健康度總覽 (淨資產與流動性風險)")
 
-# --- 第一排：65歲 淨資產 (中位數) ---
 col1, col2, col3, col4 = st.columns(4)
 with col1:
     st.metric(f"{target_age}歲淨資產 (買房+投資)", f"{target_data['買房投資_中位數']:.0f} 萬")
@@ -260,7 +268,6 @@ with col4:
 
 st.markdown("<br>", unsafe_allow_html=True)
 
-# --- 第二排：65歲 累積破產率 (Path-Dependent Ruin Prob) ---
 col5, col6, col7, col8 = st.columns(4)
 with col5:
     st.metric(f"{target_age}歲前 (買房+投資) 破產率", f"{ruin_probs['buy_inv_65']:.1f}%", 
@@ -277,19 +284,19 @@ st.markdown("<hr>", unsafe_allow_html=True)
 
 # ----------------- 圖表 1：蒙地卡羅淨資產曲線 -----------------
 st.subheader("💰 1. 人生真實淨資產 (Net Worth) 蒙地卡羅預測")
-st.markdown("實線為**純儲蓄（無投資）**之結果；虛線為投資**中位數**，陰影區域代表投資的 **90% 信心區間**。")
+st.markdown("實線為**純儲蓄（無投資）**之基準；虛線為市場動態下之**中位數**，陰影區間代表 **90% 信心水準**。")
 
 fig_nw = go.Figure()
 
-# 買房 + 投資
+# 買房情境
 fig_nw.add_trace(go.Scatter(x=df_res['年齡'], y=df_res['買房投資_P95'], mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'))
-fig_nw.add_trace(go.Scatter(x=df_res['年齡'], y=df_res['買房投資_P5'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(52, 199, 89, 0.2)', name='買房+投資 (90% 信心區間)'))
+fig_nw.add_trace(go.Scatter(x=df_res['年齡'], y=df_res['買房投資_P5'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(52, 199, 89, 0.2)', name='買房+投資 (90% 區間)'))
 fig_nw.add_trace(go.Scatter(x=df_res['年齡'], y=df_res['買房投資_中位數'], mode='lines', line=dict(color='#34C759', width=3, dash='dash'), name='買房+投資 (中位數)'))
 fig_nw.add_trace(go.Scatter(x=df_res['年齡'], y=df_res['買房_無投資'], mode='lines', line=dict(color='#FF3B30', width=3), name='買房純儲蓄'))
 
-# 純租 + 投資
+# 純租情境
 fig_nw.add_trace(go.Scatter(x=df_res['年齡'], y=df_res['純租投資_P95'], mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'))
-fig_nw.add_trace(go.Scatter(x=df_res['年齡'], y=df_res['純租投資_P5'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(0, 122, 255, 0.2)', name='純租+投資 (90% 信心區間)'))
+fig_nw.add_trace(go.Scatter(x=df_res['年齡'], y=df_res['純租投資_P5'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(0, 122, 255, 0.2)', name='純租+投資 (90% 區間)'))
 fig_nw.add_trace(go.Scatter(x=df_res['年齡'], y=df_res['純租投資_中位數'], mode='lines', line=dict(color='#007AFF', width=3, dash='dash'), name='純租+投資 (中位數)'))
 fig_nw.add_trace(go.Scatter(x=df_res['年齡'], y=df_res['純租_無投資'], mode='lines', line=dict(color='#8E8E93', width=3), name='純租純儲蓄'))
 
@@ -303,14 +310,13 @@ st.plotly_chart(fig_nw, use_container_width=True)
 
 # ----------------- 圖表 2：年度收支平衡曲線 -----------------
 st.subheader("⚖️ 2. 年度淨現金流曲線 (Cash Flow Dynamics)")
-st.markdown("觀察**寬限期**結束後的現金流斷崖，以及退休後停止主動收入的流動性消耗。")
 
 fig_cf = px.line(
     df_res, x='年齡', y=['純租_現金流', '買房_現金流'],
     labels={'value': '年度淨現金流 (萬元)', 'variable': '現金流情境'},
     color_discrete_sequence=['#007AFF', '#FF3B30']
 )
-fig_cf.add_hline(y=0, line_dash="dash", line_color="#8E8E93", annotation_text="收支平衡線 (0 萬元)", annotation_position="bottom right")
+fig_cf.add_hline(y=0, line_dash="dash", line_color="#8E8E93", annotation_text="收支平衡線", annotation_position="bottom right")
 fig_cf.update_layout(
     plot_bgcolor='white', paper_bgcolor='white', hovermode="x unified",
     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
@@ -320,13 +326,13 @@ fig_cf.update_layout(
 st.plotly_chart(fig_cf, use_container_width=True)
 
 # ----------------- 財務洞察 -----------------
-with st.expander("📝 專家量化洞察報告 (點擊展開)", expanded=True):
+with st.expander("📝 量化專家診斷報告 (點擊展開)", expanded=True):
     st.write(f"""
     ### 深度量化診斷結果
     
     | 診斷維度 | 量化回測事實 | 財務意義 |
     | :--- | :--- | :--- |
-    | **破產風險評估 <br> (Probability of Ruin)** | 終老純租破產率：**{ruin_probs['rent_inv_end']:.1f}%** <br> 終老買房破產率：**{ruin_probs['buy_inv_end']:.1f}%** | 修正為**路徑依賴演算法**後，只要在生命週期中「曾跌破 0 萬元」即計入破產。買房初期的頭期款加上寬限期結束後的本息攤還，極易在市場下行時觸發流動性違約危機。 |
-    | **最大回撤與波動 <br> (Max Drawdown)** | 買房投資 MDD：**-{mdd_stats['buy_mdd']:.1f}%** <br> 純租投資 MDD：**-{mdd_stats['rent_mdd']:.1f}%** | 純租情境的資產完全暴露於市場波動；買房情境則因房產本身的低波動性（年增值 {p_house_appr*100:.1f}%）提供了實質的淨資產下檔保護。 |
-    | **寬限期與槓桿 <br> (Grace Period & Leverage)** | 房貸寬限期：**{p_grace_years} 年** <br> 寬限期滿月繳：**{(mort_pmt[p_grace_years]/12):.1f} 萬** | 寬限期透過延遲本金償還，將資金釋放至市場賺取風險溢酬（Risk Premium）。本質上是利用定息債務作為做空法定貨幣購買力的對沖工具。 |
+    | **破產風險評估 <br> (Probability of Ruin)** | 終老純租破產率：**{ruin_probs['rent_inv_end']:.1f}%** <br> 終老買房破產率：**{ruin_probs['buy_inv_end']:.1f}%** | 嚴格依循路徑依賴演算法，生命週期中「流動性跌破 0」即觸發實質違約。買房情境在寬限期結束後的現金流斷層，是誘發流動性危機的最大震央。 |
+    | **最大回撤與波動 <br> (Max Drawdown)** | 買房投資 MDD：**-{mdd_stats['buy_mdd']:.1f}%** <br> 純租投資 MDD：**-{mdd_stats['rent_mdd']:.1f}%** | 純租情境的淨資產完全暴露於市場波動風險；而買房情境藉由低波動實體資產（年增值 {p_house_appr*100:.1f}%），實質上提供了投資組合下檔保護。 |
+    | **寬限期與槓桿 <br> (Grace Period & Leverage)** | 房貸寬限期：**{p_grace_years} 年** <br> 寬限期滿月繳：**{(mort_pmt[p_grace_years]/12 if p_grace_years < len(mort_pmt) else 0):.1f} 萬** | 寬限期本質上是一種**流動性跨期套利**，將應償本金釋放至資本市場賺取風險溢酬 (Risk Premium)。但必須警惕攤還期啟動時造成的現金流擠壓效應。 |
     """)
