@@ -160,7 +160,7 @@ class LifeFinancialALM:
         target_age = 65 if 65 in self.ages else self.ages[-1]
         idx_target = np.where(self.ages == target_age)[0][0]
         
-        # [修正] 嚴謹的路徑依賴破產判定：只要在目標年齡前，流動資產曾 < 0 即視為破產
+        # 嚴謹的路徑依賴破產判定：只要在目標年齡前，流動資產曾 < 0 即視為破產
         ruin_probs = {
             'buy_inv_65': np.mean(np.any(mc_buy_invest[:idx_target+1, :] < 0, axis=0)) * 100,
             'rent_inv_65': np.mean(np.any(mc_rent_invest[:idx_target+1, :] < 0, axis=0)) * 100,
@@ -170,13 +170,11 @@ class LifeFinancialALM:
             'buy_inv_end': np.mean(np.any(mc_buy_invest < 0, axis=0)) * 100
         }
         
-        # [新增] 計算 65 歲前總淨資產的最大回撤率 (Max Drawdown, MDD) 中位數
+        # 計算 65 歲前總淨資產的最大回撤率 (Max Drawdown, MDD) 中位數
         def calc_median_mdd(net_worth_paths, end_idx):
             paths_subset = net_worth_paths[:end_idx+1, :]
             peaks = np.maximum.accumulate(paths_subset, axis=0)
-            # 避免除以零
             drawdowns = (paths_subset - peaks) / np.where(peaks <= 0, 1e-9, peaks)
-            # 將因淨資產為負造成的異常值截斷
             drawdowns = np.clip(drawdowns, -1, 0)
             max_drawdowns = np.min(drawdowns, axis=0)
             return abs(np.median(max_drawdowns)) * 100
@@ -216,7 +214,7 @@ with st.sidebar:
     p_paths = st.selectbox("蒙地卡羅路徑數", options=[100, 500, 1000, 5000], index=2)
     
     st.markdown("---")
-    st.subheader("🏠 購屋與貸款模組 (Mortgage Input)")
+    st.subheader("🏠 購屋與貸款模組")
     p_buy_age = st.number_input("預計買房年齡", min_value=p_age, max_value=80, value=35, step=1)
     p_house_price = st.number_input("房屋總價 (萬元)", min_value=100, value=1500, step=100)
     p_down_pmt = st.number_input("頭期款 (萬元)", min_value=100, value=300, step=50)
@@ -302,6 +300,24 @@ fig_nw.update_layout(
     yaxis=dict(showgrid=True, gridcolor='#E5E5EA', title='真實淨資產 (萬元)')
 )
 st.plotly_chart(fig_nw, use_container_width=True)
+
+# ----------------- 圖表 2：年度收支平衡曲線 -----------------
+st.subheader("⚖️ 2. 年度淨現金流曲線 (Cash Flow Dynamics)")
+st.markdown("觀察**寬限期**結束後的現金流斷崖，以及退休後停止主動收入的流動性消耗。")
+
+fig_cf = px.line(
+    df_res, x='年齡', y=['純租_現金流', '買房_現金流'],
+    labels={'value': '年度淨現金流 (萬元)', 'variable': '現金流情境'},
+    color_discrete_sequence=['#007AFF', '#FF3B30']
+)
+fig_cf.add_hline(y=0, line_dash="dash", line_color="#8E8E93", annotation_text="收支平衡線 (0 萬元)", annotation_position="bottom right")
+fig_cf.update_layout(
+    plot_bgcolor='white', paper_bgcolor='white', hovermode="x unified",
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    xaxis=dict(showgrid=True, gridcolor='#E5E5EA', title='年齡'),
+    yaxis=dict(showgrid=True, gridcolor='#E5E5EA', title='年度淨現金流 (萬元)')
+)
+st.plotly_chart(fig_cf, use_container_width=True)
 
 # ----------------- 財務洞察 -----------------
 with st.expander("📝 專家量化洞察報告 (點擊展開)", expanded=True):
