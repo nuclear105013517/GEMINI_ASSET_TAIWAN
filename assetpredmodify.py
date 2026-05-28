@@ -18,13 +18,50 @@ class LifeFinancialALM:
         self.N_paths = self.p.get('模擬路徑數', 1000)
 
     def generate_base_cashflows(self):
-        """產生基礎通膨與現金流 (純向量化計算)"""
+        """產生基礎通膨與現金流，並納入台灣勞退帳戶精算 (純向量化計算)"""
         inflation_mult = (1 + self.p['通膨率']) ** np.arange(self.N_years)
         salary = np.where(self.ages <= self.p['退休年齡'], self.p['月薪'] * 12 * inflation_mult, 0)
         expenses = self.p['月開銷'] * 12 * inflation_mult
         rent = self.p['月房租'] * 12 * inflation_mult
         
-        net_cashflow_renting = salary - expenses - rent
+        # ---------------------------------------------------------
+        # 勞退帳戶精算模組 (參考台灣勞退新制)
+        # ---------------------------------------------------------
+        idx_retire = np.where(self.ages == self.p['退休年齡'])[0][0] if self.p['退休年齡'] in self.ages else 0
+        pension_cf_net = np.zeros(self.N_years)
+        
+        pension_return = self.p['勞退報酬率']
+        current_pension = self.p['勞退目前提撥']
+        
+        # 1. 提撥期 (Accumulation Phase)：複利累積至退休年齡
+        if idx_retire > 0:
+            for t in range(idx_retire):
+                # 假設每月提撥額會隨薪資/通膨同步成長
+                contribution = self.p['勞退每月提撥'] * 12 * inflation_mult[t]
+                current_pension = current_pension * (1 + pension_return) + contribution
+                
+        # 2. 提領期 (Withdrawal Phase)：依勞退規定年金化計算至 84 歲
+        payout_years = 84 - self.p['退休年齡']
+        
+        if payout_years > 0 and current_pension > 0:
+            if pension_return > 0:
+                payout_annual = current_pension * (pension_return * (1 + pension_return)**payout_years) / ((1 + pension_return)**payout_years - 1)
+            else:
+                payout_annual = current_pension / payout_years
+                
+            # 將年金化後的退休金加入退休後的現金流 (發放至 84 歲為止)
+            for t in range(idx_retire, self.N_years):
+                if self.ages[t] <= 84:
+                    pension_cf_net[t] = payout_annual
+                    
+        elif payout_years <= 0 and idx_retire < self.N_years:
+            # 例外處理：若退休年齡設定大於等於 84 歲，改為一次性領出
+            pension_cf_net[idx_retire] = current_pension
+
+        # 淨現金流合併：薪資 - 開銷 - 房租 + 勞退年金收入
+        # (註：為符合多數人習慣，提撥期的資金採外加計算，不從流動現金流中扣除)
+        net_cashflow_renting = salary - expenses - rent + pension_cf_net
+        
         return net_cashflow_renting, rent, inflation_mult
 
     def generate_mortgage_schedule(self):
@@ -71,7 +108,7 @@ class LifeFinancialALM:
             
             # 剩餘本金封閉解： PMT * [1 - (1+r)^-M] / r
             rem_prin = monthly_pmt * (1 - (1 + monthly_rate)**(-months_left)) / monthly_rate
-            remaining_principal[valid_grace:valid_total] = np.clip(rem_prin, 0, None) # 避免浮點數誤差導致負數
+            remaining_principal[valid_grace:valid_total] = np.clip(rem_prin, 0, None) 
 
         return yearly_pmt, remaining_principal, loan_amount
 
@@ -109,7 +146,7 @@ class LifeFinancialALM:
         """量化蒙地卡羅投資模擬 (處理破產路徑依賴與嚴謹的GBM隨機過程)"""
         wealth = np.zeros((self.N_years, self.N_paths))
         
-        # 【修正核心】：Day-1 的初始財富池 = 初始流動資金 + 現有投資部位 + 第一年的淨現金流
+        # Day-1 的初始財富池 = 初始流動資金 + 現有投資部位 + 第一年的淨現金流
         wealth[0, :] = self.p['起始資金'] + self.p['現有投資'] + cashflows[0]
         
         if is_investing:
@@ -210,15 +247,20 @@ with st.sidebar:
     p_age = st.number_input("目前年齡", min_value=20, max_value=60, value=30, step=1)
     p_retire = st.number_input("預計退休年齡", min_value=40, max_value=80, value=65, step=1)
     
-    # 【新增參數】：將起始資金與現有投資部位分開設定，方便使用者釐清流動性來源
     p_capital = st.number_input("起始流動資金 (萬元)", min_value=0, value=100, step=10, help="目前的現金存款")
     p_exist_invest = st.number_input("目前已投資部位 (萬元)", min_value=0, value=100, step=10, help="目前已經投入股市/基金等市場的資產")
     
     p_inflation = st.number_input("年通膨/薪資成長率 (%)", min_value=0.0, value=2.0, step=0.5) / 100.0
     
-    p_salary = st.number_input("目前平均月薪 (萬元)", min_value=0.0, value=8.0, step=0.5)
+    p_salary = st.number_input("目前平均月薪 (萬元)", min_value=0.0, value=8.0, step=0.5, help="實領金額")
     p_expense = st.number_input("目前月開銷 (萬元)", min_value=0.0, value=3.0, step=0.1)
     p_rent = st.number_input("目前月房租 (萬元)", min_value=0.0, value=2.0, step=0.1)
+
+    st.markdown("---")
+    st.subheader("🛡️ 退休金與勞退帳戶 (台灣勞退機制)")
+    p_pension_current = st.number_input("目前已提撥勞退本金 (萬元)", min_value=0.0, value=30.0, step=10.0, help="勞退個人專戶目前累積之本金與收益")
+    p_pension_monthly = st.number_input("每月持續提撥額 (萬元)", min_value=0.0, value=0.6, step=0.1, help="含雇主6%與自提。此資金獨立累積，不扣除上方月薪之流動現金。")
+    p_pension_return = st.number_input("勞退基金保證年化報酬率 (%)", value=2.0, step=0.1) / 100.0
     
     st.markdown("---")
     st.subheader("📊 投資市場動態")
@@ -242,10 +284,11 @@ with st.sidebar:
     p_loan_rate = st.number_input("房貸利率 (%)", value=2.1, step=0.1) / 100.0
     p_house_appr = st.number_input("房產年增值率 (%)", value=1.5, step=0.1) / 100.0
 
-# 【新增映射】：確保參數被送入核心引擎
+# 參數映射：新增勞退相關變數
 params = {
     '起始年齡': p_age, '退休年齡': p_retire, '起始資金': p_capital, '現有投資': p_exist_invest, '通膨率': p_inflation,
     '月薪': p_salary, '月開銷': p_expense, '月房租': p_rent,
+    '勞退目前提撥': p_pension_current, '勞退每月提撥': p_pension_monthly, '勞退報酬率': p_pension_return,
     '投資比例': p_inv_ratio, '預期報酬': p_return, '預期波動率': p_volatility, '模擬路徑數': p_paths,
     '買房年齡': p_buy_age, '房價': p_house_price, '頭期款': p_down_pmt,
     '房產年增值': p_house_appr, '房貸年限': p_loan_years, '寬限期': p_grace_years, '房貸利率': p_loan_rate
@@ -339,6 +382,6 @@ with st.expander("📝 量化專家診斷報告 (點擊展開)", expanded=True):
     | 診斷維度 | 量化回測事實 | 財務意義 |
     | :--- | :--- | :--- |
     | **破產風險評估 <br> (Probability of Ruin)** | 終老純租破產率：**{ruin_probs['rent_inv_end']:.1f}%** <br> 終老買房破產率：**{ruin_probs['buy_inv_end']:.1f}%** | 嚴格依循路徑依賴演算法，生命週期中「流動性跌破 0」即觸發實質違約。買房情境在寬限期結束後的現金流斷層，是誘發流動性危機的最大震央。 |
+    | **長壽風險與勞退 <br> (Longevity & Pension)** | 勞退提領至：**84 歲** <br> 85歲後勞退現金流：**0 萬** | 依台灣勞退新制規定，月領年金精算至 84 歲為止。圖表 2 中可明顯觀察到 **85 歲的二次現金流斷崖**，此後將大幅考驗自身投資組合的抗摔能力。 |
     | **最大回撤與波動 <br> (Max Drawdown)** | 買房投資 MDD：**-{mdd_stats['buy_mdd']:.1f}%** <br> 純租投資 MDD：**-{mdd_stats['rent_mdd']:.1f}%** | 純租情境的淨資產完全暴露於市場波動風險；而買房情境藉由低波動實體資產（年增值 {p_house_appr*100:.1f}%），實質上提供了投資組合下檔保護。 |
-    | **寬限期與槓桿 <br> (Grace Period & Leverage)** | 房貸寬限期：**{p_grace_years} 年** <br> 寬限期滿月繳：**{(mort_pmt[p_grace_years]/12 if p_grace_years < len(mort_pmt) else 0):.1f} 萬** | 寬限期本質上是一種**流動性跨期套利**，將應償本金釋放至資本市場賺取風險溢酬 (Risk Premium)。但必須警惕攤還期啟動時造成的現金流擠壓效應。 |
     """)
