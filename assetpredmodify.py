@@ -16,6 +16,7 @@ class LifeFinancialALM:
         self.N_years = 101 - self.p['起始年齡']
         self.ages = np.arange(self.p['起始年齡'], 101)
         self.N_paths = self.p.get('模擬路徑數', 1000)
+        self.payout_annual = 0.0  # 紀錄勞退年領金額
 
     def generate_base_cashflows(self):
         """產生基礎通膨與現金流，並納入台灣勞退帳戶精算 (純向量化計算)"""
@@ -47,11 +48,14 @@ class LifeFinancialALM:
             else:
                 payout_annual = current_pension / payout_years
                 
+            self.payout_annual = payout_annual  # 紀錄於物件屬性中供外部存取
+            
             # 利用 Boolean Masking 進行區間賦值，消除迴圈
             mask_payout = (self.ages >= self.p['退休年齡']) & (self.ages <= 84)
             pension_cf_net[mask_payout] = payout_annual
             
         elif payout_years <= 0 and idx_retire < self.N_years:
+            self.payout_annual = current_pension
             pension_cf_net[idx_retire] = current_pension
 
         net_cashflow_renting = salary - expenses - rent + pension_cf_net
@@ -222,6 +226,10 @@ class LifeFinancialALM:
         results['買房投資_中位數'] = np.median(mc_buy_net_worth, axis=1)
         results['買房投資_P5'] = np.percentile(mc_buy_net_worth, 5, axis=1)
         results['買房投資_P95'] = np.percentile(mc_buy_net_worth, 95, axis=1)
+
+        # 隱藏儲存「純流動資產」中位數，專供投資孳息精算使用
+        results['純租流動_中位數'] = np.median(mc_rent_invest, axis=1)
+        results['買房流動_中位數'] = np.median(mc_buy_invest, axis=1)
         
         # 3. 風險指標：破產判定基準依然是「流動性 (Liquidity) < 0」，而非淨資產 < 0
         target_age = 65 if 65 in self.ages else self.ages[-1]
@@ -329,6 +337,12 @@ df_res, mort_pmt, ruin_probs, mdd_stats, pl_pmt = model.run()
 target_age = 65 if 65 in df_res.index else df_res.index[-1]
 target_data = df_res.loc[target_age]
 
+# ----------------- 計算 65 歲預期投資孳息 -----------------
+# 投資組合年孳息 = 實際投入市場之流動資金 * 預期年化報酬率(μ) * 投資比例
+exp_yield_rate = p_return * p_inv_ratio
+rent_inv_return = target_data['純租流動_中位數'] * exp_yield_rate
+buy_inv_return = target_data['買房流動_中位數'] * exp_yield_rate
+
 st.subheader(f"📊 {target_age}歲 財務健康度總覽 (淨資產與流動性風險)")
 
 col1, col2, col3, col4 = st.columns(4)
@@ -409,6 +423,6 @@ with st.expander("📝 量化專家診斷報告 (點擊展開)", expanded=True):
     | :--- | :--- | :--- |
     | **破產風險評估 <br> (Probability of Ruin)** | 終老純租破產率：**{ruin_probs['rent_inv_end']:.1f}%** <br> 終老買房破產率：**{ruin_probs['buy_inv_end']:.1f}%** | 嚴格依循路徑依賴演算法，生命週期中「流動性跌破 0」即觸發實質違約。買房情境在寬限期結束後的現金流斷層，是誘發流動性危機的最大震央。 |
     | **最大回撤與波動 <br> (Max Drawdown)** | 買房投資 MDD：**-{mdd_stats['buy_mdd']:.1f}%** <br> 純租投資 MDD：**-{mdd_stats['rent_mdd']:.1f}%** | 純租情境的淨資產完全暴露於市場波動風險；而買房情境藉由低波動實體資產（年增值 {p_house_appr*100:.1f}%），實質上提供了投資組合下檔保護。 |
-    | **長壽風險與勞退 <br> (Longevity & Pension)** | 勞退提領至：**84 歲** <br> 85歲後勞退現金流：**0 萬** | 依台灣勞退新制規定，月領年金精算至 84 歲為止。圖表 2 中可明顯觀察到 **85 歲的二次現金流斷崖**，此後將大幅考驗自身投資組合的抗摔能力。 |
+    | **長壽風險與勞退 <br> (Longevity & Pension)** | 65-84歲勞退(年)：**{model.payout_annual:.1f} 萬** <br> 65歲後預期投資孳息(年)：**純租 {rent_inv_return:.1f} 萬 / 買房 {buy_inv_return:.1f} 萬** | 依台灣勞退新制規定，月領年金精算至 84 歲為止。圖表 2 中可明顯觀察到 **85 歲的二次現金流斷崖**，此後將大幅考驗自身投資組合的抗摔能力。 |
     | **消費負債拖累 <br> (Consumer Debt Drag)** | 銀行貸款年付：**{pl_pmt[0]:.1f} 萬** <br> 貸款剩餘年限：**{p_pl_years} 年** | 剛性債務（信貸/車貸）將在初期產生「現金流拖累」。由於淨資產計算中已嚴格扣除此負債，若其貸款利率大於投資組合底層期望值，將顯著放大早夭期的流動性違約風險。 |
     """)
