@@ -91,7 +91,7 @@ class LifeFinancialALM:
             cf = cashflows[t]
             prev_wealth = wealth[t-1, :]
             
-            # 破產截斷條件：若資產>0則享受市場複利，否則僅累加現金流(負債)
+            # 破產截斷條件：若流動資產>0則享受市場複利，否則僅累加現金流(負債)
             wealth[t, :] = np.where(
                 prev_wealth > 0,
                 prev_wealth * (1 + portfolio_returns[t, :]) + cf,
@@ -111,7 +111,7 @@ class LifeFinancialALM:
         det_rent_no_invest = self.simulate_wealth_mc(cf_rent, is_investing=False)[:, 0]
         det_buy_no_invest = self.simulate_wealth_mc(cf_buy, is_investing=False)[:, 0]
         
-        # 彙整結果
+        # 彙整淨資產結果
         results = pd.DataFrame(index=self.ages)
         results['年齡'] = self.ages
         results['純租_現金流'] = cf_rent
@@ -131,11 +131,20 @@ class LifeFinancialALM:
         results['買房投資_P5'] = np.percentile(mc_buy_net_worth, 5, axis=1)
         results['買房投資_P95'] = np.percentile(mc_buy_net_worth, 95, axis=1)
         
-        # 破產機率統計 (終老時流動資產小於0的機率)
-        ruin_prob_rent = np.mean(mc_rent_invest[-1, :] < 0) * 100
-        ruin_prob_buy = np.mean(mc_buy_invest[-1, :] < 0) * 100
+        # 3. 破產機率統計 (流動資產 < 0)
+        target_age = 65 if 65 in self.ages else self.ages[-1]
+        idx_target = np.where(self.ages == target_age)[0][0]
         
-        return results, mort_pmt, ruin_prob_rent, ruin_prob_buy
+        ruin_probs = {
+            'buy_inv_65': np.mean(mc_buy_invest[idx_target, :] < 0) * 100,
+            'rent_inv_65': np.mean(mc_rent_invest[idx_target, :] < 0) * 100,
+            'buy_noinv_65': 100.0 if det_buy_no_invest[idx_target] < 0 else 0.0,
+            'rent_noinv_65': 100.0 if det_rent_no_invest[idx_target] < 0 else 0.0,
+            'rent_inv_end': np.mean(mc_rent_invest[-1, :] < 0) * 100,
+            'buy_inv_end': np.mean(mc_buy_invest[-1, :] < 0) * 100
+        }
+        
+        return results, mort_pmt, ruin_probs
 
 # ==========================================
 # 2. 頁面設定與 UI 渲染
@@ -162,8 +171,6 @@ with st.sidebar:
     p_inv_ratio = st.slider("可支配資金投資比例 (%)", 0, 100, 70, 5) / 100.0
     p_return = st.number_input("預期年化報酬率 (μ) (%)", value=7.0, step=0.5) / 100.0
     p_volatility = st.number_input("年化波動率 (σ) (%)", value=15.0, step=0.5, help="S&P500 歷史波動率約為 15-18%") / 100.0
-    
-    # 【修改重點】：為路徑數新增了 help 參數與預設值
     p_paths = st.selectbox(
         "蒙地卡羅路徑數", 
         options=[100, 500, 1000, 5000], 
@@ -194,25 +201,40 @@ params = {
 }
 
 model = LifeFinancialALM(params)
-df_res, mort_pmt, ruin_rent, ruin_buy = model.run()
+df_res, mort_pmt, ruin_probs = model.run()
 
 # ==========================================
 # 3. 儀表板與數據視覺化
 # ==========================================
-col1, col2, col3, col4 = st.columns(4)
 target_age = 65 if 65 in df_res.index else df_res.index[-1]
 target_data = df_res.loc[target_age]
 
+st.subheader(f"📊 {target_age}歲 財務健康度指標")
+# 第一排：淨資產指標
+col1, col2, col3, col4 = st.columns(4)
 with col1:
-    st.metric(f"65歲淨資產 (買房+投資)", f"{target_data['買房投資_中位數']:.0f} 萬")
+    st.metric(f"{target_age}歲淨資產 (買房+投資)", f"{target_data['買房投資_中位數']:.0f} 萬")
 with col2:
-    st.metric(f"65歲淨資產 (純租+投資)", f"{target_data['純租投資_中位數']:.0f} 萬")
+    st.metric(f"{target_age}歲淨資產 (純租+投資)", f"{target_data['純租投資_中位數']:.0f} 萬")
 with col3:
-    st.metric(f"65歲淨資產 (買房純儲蓄)", f"{target_data['買房_無投資']:.0f} 萬")
+    st.metric(f"{target_age}歲淨資產 (買房純儲蓄)", f"{target_data['買房_無投資']:.0f} 萬")
 with col4:
-    st.metric(f"65歲淨資產 (純租純儲蓄)", f"{target_data['純租_無投資']:.0f} 萬")
+    st.metric(f"{target_age}歲淨資產 (純租純儲蓄)", f"{target_data['純租_無投資']:.0f} 萬")
 
 st.markdown("<br>", unsafe_allow_html=True)
+
+# 第二排：破產率指標 (流動資產小於零)
+col5, col6, col7, col8 = st.columns(4)
+with col5:
+    st.metric(f"{target_age}歲破產率 (買房+投資)", f"{ruin_probs['buy_inv_65']:.1f}%")
+with col6:
+    st.metric(f"{target_age}歲破產率 (純租+投資)", f"{ruin_probs['rent_inv_65']:.1f}%")
+with col7:
+    st.metric(f"{target_age}歲破產率 (買房純儲蓄)", f"{ruin_probs['buy_noinv_65']:.1f}%")
+with col8:
+    st.metric(f"{target_age}歲破產率 (純租純儲蓄)", f"{ruin_probs['rent_noinv_65']:.1f}%")
+
+st.markdown("<hr>", unsafe_allow_html=True)
 
 # ----------------- 圖表 1：蒙地卡羅淨資產曲線 -----------------
 st.subheader("💰 1. 人生真實淨資產 (Net Worth) 蒙地卡羅預測與純儲蓄對比")
@@ -269,7 +291,7 @@ with st.expander("📝 專家量化洞察報告 (點擊展開)", expanded=True):
     
     | 診斷維度 | 量化回測事實 | 財務意義 |
     | :--- | :--- | :--- |
-    | **破產風險評估 <br> (Probability of Ruin)** | 純租情境破產率：**{ruin_rent:.1f}%** <br> 買房情境破產率：**{ruin_buy:.1f}%** | 破產率反映在極端連續熊市（SORR）或高齡長壽風險下，現金流完全斷裂的機率。買房通常具備「鎖定居住成本」的防禦力，但若**頭期款耗盡過多流動資金**，初期的破產脆弱度反而會短暫飆高。 |
+    | **破產風險評估 <br> (Probability of Ruin)** | 終老純租破產率：**{ruin_probs['rent_inv_end']:.1f}%** <br> 終老買房破產率：**{ruin_probs['buy_inv_end']:.1f}%** | 破產率反映在極端連續熊市（SORR）或高齡長壽風險下，現金流完全斷裂的機率。買房通常具備「鎖定居住成本」的防禦力，但若**頭期款耗盡過多流動資金**，初期的破產脆弱度反而會短暫飆高。 |
     | **資產波動耗損 <br> (Volatility Drag)** | 設定年化波動率：**{p_volatility*100:.0f}%** | 在純投資情境中，你可觀察到「90% 信心區間」的下限有多深。幾何平均報酬永遠小於算術平均，即使預期報酬設為 7%，**高波動率會導致財富累積的中位數大幅低於確定性的直線推估**，這就是真實世界的波動耗損。 |
-    | **通膨與槓桿效應 <br> (Inflation & Leverage)** | 房貸年限：**{p_loan_years}年** <br> 預估通膨：**{p_inflation*100:.1f}%** | 對比「純儲蓄」與「有投資」的曲線，可以發現若只持有法幣（純儲蓄），資產必定被通膨巨獸啃食。而房地產本質是**高度槓桿的抗通膨債券**，在長年期定息房貸下，實質上是一種作空法幣購買力的量化對沖策略。 |
+    | **通膨與槓桿效應 <br> (Inflation & Leverage)** | 房貸年限：**{p_loan_years}年** <br> 預估通膨：**{p_inflation*100:.1f}%** <br> 預估月房貸：**{mort_pmt/12:.1f} 萬** | 對比「純儲蓄」與「有投資」的曲線，可以發現若只持有法幣（純儲蓄），資產必定被通膨巨獸啃食。而房地產本質是**高度槓桿的抗通膨債券**，在長年期定息房貸下，每個月 {mort_pmt/12:.1f} 萬的實質購買力會逐年遞減，實質上是一種作空法幣的量化對沖策略。 |
     """)
