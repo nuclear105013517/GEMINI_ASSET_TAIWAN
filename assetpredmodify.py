@@ -58,14 +58,17 @@ class LifeFinancialALM:
             idx_buy = np.where(self.ages == self.p['買房年齡'])[0][0]
             idx_end = min(idx_buy + self.p['房貸年限'], self.N_years)
             
+            # 買房現金流重構：扣頭期款、停付房租、繳房貸
             cf_buying[idx_buy] -= self.p['頭期款']
             cf_buying[idx_buy:] += rent_array[idx_buy:] 
             cf_buying[idx_buy:idx_end] -= yearly_mortgage_pmt
             
+            # 房產市值 (幾何增值)
             years_owned = np.arange(self.N_years) - idx_buy
             appreciation = (1 + self.p['房產年增值']) ** np.clip(years_owned, 0, None)
             property_value[idx_buy:] = self.p['房價'] * appreciation[idx_buy:]
             
+            # 房貸餘額
             mortgage_balance[idx_buy:idx_end] = remaining_principal[1 : idx_end - idx_buy + 1]
 
         return cf_renting, cf_buying, property_value, mortgage_balance, yearly_mortgage_pmt
@@ -88,6 +91,7 @@ class LifeFinancialALM:
             cf = cashflows[t]
             prev_wealth = wealth[t-1, :]
             
+            # 破產截斷條件：若資產>0則享受市場複利，否則僅累加現金流(負債)
             wealth[t, :] = np.where(
                 prev_wealth > 0,
                 prev_wealth * (1 + portfolio_returns[t, :]) + cf,
@@ -157,7 +161,7 @@ with st.sidebar:
     st.subheader("📊 投資市場動態 (Market Dynamics)")
     p_inv_ratio = st.slider("可支配資金投資比例 (%)", 0, 100, 70, 5) / 100.0
     p_return = st.number_input("預期年化報酬率 (μ) (%)", value=7.0, step=0.5) / 100.0
-    p_volatility = st.number_input("年化波動率 (σ) (%)", value=15.0, step=0.5) / 100.0
+    p_volatility = st.number_input("年化波動率 (σ) (%)", value=15.0, step=0.5, help="S&P500 歷史波動率約為 15-18%") / 100.0
     p_paths = st.selectbox("蒙地卡羅路徑數", [100, 500, 1000, 5000], index=1)
     
     st.markdown("---")
@@ -246,3 +250,15 @@ fig_cf.update_layout(
     yaxis=dict(showgrid=True, gridcolor='#E5E5EA', title='年度淨現金流 (萬元)')
 )
 st.plotly_chart(fig_cf, use_container_width=True)
+
+# ----------------- 財務洞察 -----------------
+with st.expander("📝 專家量化洞察報告 (點擊展開)", expanded=True):
+    st.write(f"""
+    ### 深度量化診斷結果
+    
+    | 診斷維度 | 量化回測事實 | 財務意義 |
+    | :--- | :--- | :--- |
+    | **破產風險評估 <br> (Probability of Ruin)** | 純租情境破產率：**{ruin_rent:.1f}%** <br> 買房情境破產率：**{ruin_buy:.1f}%** | 破產率反映在極端連續熊市（SORR）或高齡長壽風險下，現金流完全斷裂的機率。買房通常具備「鎖定居住成本」的防禦力，但若**頭期款耗盡過多流動資金**，初期的破產脆弱度反而會短暫飆高。 |
+    | **資產波動耗損 <br> (Volatility Drag)** | 設定年化波動率：**{p_volatility*100:.0f}%** | 在純投資情境中，你可觀察到「90% 信心區間」的下限有多深。幾何平均報酬永遠小於算術平均，即使預期報酬設為 7%，**高波動率會導致財富累積的中位數大幅低於確定性的直線推估**，這就是真實世界的波動耗損。 |
+    | **通膨與槓桿效應 <br> (Inflation & Leverage)** | 房貸年限：**{p_loan_years}年** <br> 預估通膨：**{p_inflation*100:.1f}%** | 對比「純儲蓄」與「有投資」的曲線，可以發現若只持有法幣（純儲蓄），資產必定被通膨巨獸啃食。而房地產本質是**高度槓桿的抗通膨債券**，在長年期定息房貸下，實質上是一種作空法幣購買力的量化對沖策略。 |
+    """)
