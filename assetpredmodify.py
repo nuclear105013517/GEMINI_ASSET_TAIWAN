@@ -131,7 +131,7 @@ class LifeFinancialALM:
         results['買房投資_P5'] = np.percentile(mc_buy_net_worth, 5, axis=1)
         results['買房投資_P95'] = np.percentile(mc_buy_net_worth, 95, axis=1)
         
-        # 3. 破產機率統計 (流動資產 < 0)
+        # 3. 精密計算：65 歲當下的流動性破產機率 (流動資產 < 0)
         target_age = 65 if 65 in self.ages else self.ages[-1]
         idx_target = np.where(self.ages == target_age)[0][0]
         
@@ -209,8 +209,9 @@ df_res, mort_pmt, ruin_probs = model.run()
 target_age = 65 if 65 in df_res.index else df_res.index[-1]
 target_data = df_res.loc[target_age]
 
-st.subheader(f"📊 {target_age}歲 財務健康度指標")
-# 第一排：淨資產指標
+st.subheader(f"📊 {target_age}歲 財務健康度總覽 (淨資產與破產風險)")
+
+# --- 第一排：65歲 淨資產 (中位數) ---
 col1, col2, col3, col4 = st.columns(4)
 with col1:
     st.metric(f"{target_age}歲淨資產 (買房+投資)", f"{target_data['買房投資_中位數']:.0f} 萬")
@@ -223,16 +224,20 @@ with col4:
 
 st.markdown("<br>", unsafe_allow_html=True)
 
-# 第二排：破產率指標 (流動資產小於零)
+# --- 第二排：65歲 精密破產率 (流動資產枯竭機率) ---
 col5, col6, col7, col8 = st.columns(4)
 with col5:
-    st.metric(f"{target_age}歲破產率 (買房+投資)", f"{ruin_probs['buy_inv_65']:.1f}%")
+    st.metric(f"{target_age}歲淨資產 (買房+投資)破產率", f"{ruin_probs['buy_inv_65']:.2f}%", 
+              delta="風險指標" if ruin_probs['buy_inv_65'] > 0 else "安全", delta_color="inverse")
 with col6:
-    st.metric(f"{target_age}歲破產率 (純租+投資)", f"{ruin_probs['rent_inv_65']:.1f}%")
+    st.metric(f"{target_age}歲淨資產 (純租+投資)破產率", f"{ruin_probs['rent_inv_65']:.2f}%",
+              delta="風險指標" if ruin_probs['rent_inv_65'] > 0 else "安全", delta_color="inverse")
 with col7:
-    st.metric(f"{target_age}歲破產率 (買房純儲蓄)", f"{ruin_probs['buy_noinv_65']:.1f}%")
+    st.metric(f"{target_age}歲淨資產 (買房純儲蓄)破產率", f"{ruin_probs['buy_noinv_65']:.2f}%",
+              delta="風險指標" if ruin_probs['buy_noinv_65'] > 0 else "安全", delta_color="inverse")
 with col8:
-    st.metric(f"{target_age}歲破產率 (純租純儲蓄)", f"{ruin_probs['rent_noinv_65']:.1f}%")
+    st.metric(f"{target_age}歲淨資產 (純租純儲蓄)破產率", f"{ruin_probs['rent_noinv_65']:.2f}%",
+              delta="風險指標" if ruin_probs['rent_noinv_65'] > 0 else "安全", delta_color="inverse")
 
 st.markdown("<hr>", unsafe_allow_html=True)
 
@@ -249,7 +254,7 @@ fig_nw.add_trace(go.Scatter(x=df_res['年齡'], y=df_res['買房投資_P5'], mod
 fig_nw.add_trace(go.Scatter(x=df_res['年齡'], y=df_res['買房投資_中位數'], mode='lines', line=dict(color='#34C759', width=3, dash='dash'), name='買房+投資 (中位數)'))
 
 # 買房無投資 (紅色實線)
-fig_nw.add_trace(go.Scatter(x=df_res['年齡'], y=df_res['買房_無投資'], mode='lines', line=dict(color='#FF3B30', width=3), name='買房+純儲蓄'))
+fig_nw.add_trace(go.Scatter(x=df_res['年齡'], y=df_res['買房_無投資'], mode='lines', line=dict(color='#FF3B30', width=3), name='買房純儲蓄'))
 
 # --- 純租情境群 (藍色/灰色系) ---
 # 純租 + 投資 (藍色系)
@@ -258,7 +263,7 @@ fig_nw.add_trace(go.Scatter(x=df_res['年齡'], y=df_res['純租投資_P5'], mod
 fig_nw.add_trace(go.Scatter(x=df_res['年齡'], y=df_res['純租投資_中位數'], mode='lines', line=dict(color='#007AFF', width=3, dash='dash'), name='純租+投資 (中位數)'))
 
 # 純租無投資 (灰色實線)
-fig_nw.add_trace(go.Scatter(x=df_res['年齡'], y=df_res['純租_無投資'], mode='lines', line=dict(color='#8E8E93', width=3), name='純租+純儲蓄'))
+fig_nw.add_trace(go.Scatter(x=df_res['年齡'], y=df_res['純租_無投資'], mode='lines', line=dict(color='#8E8E93', width=3), name='純租純儲蓄'))
 
 fig_nw.update_layout(
     plot_bgcolor='white', paper_bgcolor='white', hovermode="x unified",
@@ -291,7 +296,7 @@ with st.expander("📝 專家量化洞察報告 (點擊展開)", expanded=True):
     
     | 診斷維度 | 量化回測事實 | 財務意義 |
     | :--- | :--- | :--- |
-    | **破產風險評估 <br> (Probability of Ruin)** | 終老純租破產率：**{ruin_probs['rent_inv_end']:.1f}%** <br> 終老買房破產率：**{ruin_probs['buy_inv_end']:.1f}%** | 破產率反映在極端連續熊市（SORR）或高齡長壽風險下，現金流完全斷裂的機率。買房通常具備「鎖定居住成本」的防禦力，但若**頭期款耗盡過多流動資金**，初期的破產脆弱度反而會短暫飆高。 |
-    | **資產波動耗損 <br> (Volatility Drag)** | 設定年化波動率：**{p_volatility*100:.0f}%** | 在純投資情境中，你可觀察到「90% 信心區間」的下限有多深。幾何平均報酬永遠小於算術平均，即使預期報酬設為 7%，**高波動率會導致財富累積的中位數大幅低於確定性的直線推估**，這就是真實世界的波動耗損。 |
-    | **通膨與槓桿效應 <br> (Inflation & Leverage)** | 房貸年限：**{p_loan_years}年** <br> 預估通膨：**{p_inflation*100:.1f}%** <br> 預估月房貸：**{mort_pmt/12:.1f} 萬** | 對比「純儲蓄」與「有投資」的曲線，可以發現若只持有法幣（純儲蓄），資產必定被通膨巨獸啃食。而房地產本質是**高度槓桿的抗通膨債券**，在長年期定息房貸下，每個月 {mort_pmt/12:.1f} 萬的實質購買力會逐年遞減，實質上是一種作空法幣的量化對沖策略。 |
+    | **破產風險評估 <br> (Probability of Ruin)** | 終老純租破產率：**{ruin_probs['rent_inv_end']:.2f}%** <br> 終老買房破產率：**{ruin_probs['buy_inv_end']:.2f}%** | 此處的破產定義為「流動資產枯竭」。即使房產具有殘值（淨資產為正），若沒有足夠的現金流支應生活與貸款，仍算實質違約。買房初期因頭期款抽乾流動性，在遇到崩盤時破產率極高；但長期來看則因鎖定居住成本而降低長壽風險。 |
+    | **資產波動耗損 <br> (Volatility Drag)** | 設定年化波動率：**{p_volatility*100:.0f}%** | 觀察圖 1 的「90% 信心區間」下緣。幾何平均報酬永遠小於算術平均，高波動率會導致財富累積的中位數低於直線推估（波動耗損）。 |
+    | **通膨與槓桿效應 <br> (Inflation & Leverage)** | 房貸年限：**{p_loan_years}年** <br> 預估通膨：**{p_inflation*100:.1f}%** <br> 預估月房貸：**{mort_pmt/12:.1f} 萬** | 對比「純儲蓄」與「有投資」曲線，純儲蓄的法幣購買力會被通膨完全吞噬。房地產本質是**高度槓桿的抗通膨債券**，長年期定息房貸下，每個月 **{mort_pmt/12:.1f} 萬** 的實質購買力會逐年遞減，本質上是作空法幣的對沖策略。 |
     """)
