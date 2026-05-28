@@ -5,7 +5,7 @@ import plotly.graph_objects as go
 import numpy as np
 
 # ==========================================
-# 1. 核心量化模型：資產負債與蒙地卡羅引擎
+# 1. 核心量化模型：資產負債與蒙地卡羅引擎 (經極限向量化優化)
 # ==========================================
 class LifeFinancialALM:
     """
@@ -19,25 +19,26 @@ class LifeFinancialALM:
 
     def generate_base_cashflows(self):
         """產生基礎通膨與現金流，並納入台灣勞退帳戶精算 (純向量化計算)"""
+        # 1. 基礎通膨與收支
         inflation_mult = (1 + self.p['通膨率']) ** np.arange(self.N_years)
         salary = np.where(self.ages <= self.p['退休年齡'], self.p['月薪'] * 12 * inflation_mult, 0)
         expenses = self.p['月開銷'] * 12 * inflation_mult
         rent = self.p['月房租'] * 12 * inflation_mult
         
-        # ---------------------------------------------------------
-        # 勞退帳戶精算模組 (參考台灣勞退新制)
-        # ---------------------------------------------------------
-        idx_retire = np.where(self.ages == self.p['退休年齡'])[0][0] if self.p['退休年齡'] in self.ages else 0
+        # 2. 勞退帳戶精算模組 (完全向量化消除迴圈)
         pension_cf_net = np.zeros(self.N_years)
+        idx_retire = max(0, self.p['退休年齡'] - self.p['起始年齡']) if self.p['退休年齡'] in self.ages else 0
         
         pension_return = self.p['勞退報酬率']
         current_pension = self.p['勞退目前提撥']
         
         if idx_retire > 0:
-            for t in range(idx_retire):
-                contribution = self.p['勞退每月提撥'] * 12 * inflation_mult[t]
-                current_pension = current_pension * (1 + pension_return) + contribution
-                
+            # 數學封閉解：計算隨通膨遞增之年金終值 (FV of Growing Annuity)
+            contributions = self.p['勞退每月提撥'] * 12 * inflation_mult[:idx_retire]
+            compound_factors = (1 + pension_return) ** np.arange(idx_retire - 1, -1, -1)
+            accumulated_contributions = np.sum(contributions * compound_factors)
+            current_pension = current_pension * ((1 + pension_return) ** idx_retire) + accumulated_contributions
+            
         payout_years = 84 - self.p['退休年齡']
         
         if payout_years > 0 and current_pension > 0:
@@ -46,10 +47,10 @@ class LifeFinancialALM:
             else:
                 payout_annual = current_pension / payout_years
                 
-            for t in range(idx_retire, self.N_years):
-                if self.ages[t] <= 84:
-                    pension_cf_net[t] = payout_annual
-                    
+            # 利用 Boolean Masking 進行區間賦值，消除迴圈
+            mask_payout = (self.ages >= self.p['退休年齡']) & (self.ages <= 84)
+            pension_cf_net[mask_payout] = payout_annual
+            
         elif payout_years <= 0 and idx_retire < self.N_years:
             pension_cf_net[idx_retire] = current_pension
 
@@ -83,8 +84,6 @@ class LifeFinancialALM:
         
         if valid_years > 0:
             yearly_pmt[:valid_years] = amort_yearly_pmt
-            
-            # 各年年底剩餘期數(月)
             y_idx = np.arange(1, valid_years + 1)
             months_left = months - (y_idx * 12)
             
@@ -120,6 +119,7 @@ class LifeFinancialALM:
             monthly_pmt = loan_amount * (monthly_rate * (1 + monthly_rate)**rem_months) / ((1 + monthly_rate)**rem_months - 1)
         else:
             monthly_pmt = 0
+            
         amort_yearly_pmt = monthly_pmt * 12
         
         valid_grace = min(grace_years, self.N_years)
@@ -131,7 +131,6 @@ class LifeFinancialALM:
             
         if valid_total > valid_grace:
             yearly_pmt[valid_grace:valid_total] = amort_yearly_pmt
-            
             y_idx = np.arange(1, valid_total - valid_grace + 1)
             months_left = rem_months - (y_idx * 12)
             
@@ -147,7 +146,6 @@ class LifeFinancialALM:
         # 1. 扣除剛性消費性貸款 (信貸/車貸)
         pl_pmt, pl_bal = self.generate_personal_loan_schedule()
         cf_renting -= pl_pmt
-        
         cf_buying = np.copy(cf_renting)
         
         # 2. 建構房產與房貸模組
@@ -177,22 +175,21 @@ class LifeFinancialALM:
         wealth[0, :] = self.p['起始資金'] + self.p['現有投資'] + cashflows[0]
         
         if is_investing:
-            Z = np.random.normal(0, 1, (self.N_years, self.N_paths))
+            # 採用 standard_normal 提升隨機矩陣生成效能
+            Z = np.random.standard_normal((self.N_years, self.N_paths))
             mu = self.p['預期報酬'] * self.p['投資比例']
             sigma = self.p['預期波動率'] * self.p['投資比例']
-            portfolio_returns = np.exp((mu - (sigma**2)/2) + sigma * Z) - 1
+            # 預先計算幾何布朗運動的乘數，移出迴圈
+            M = np.exp((mu - (sigma**2)/2) + sigma * Z)
         else:
-            portfolio_returns = np.zeros((self.N_years, self.N_paths))
+            M = np.ones((self.N_years, self.N_paths))
         
+        # 狀態依賴(State-dependent)漂移率：需保留時間維度迭代，但對 N_paths 進行極限向量化
         for t in range(1, self.N_years):
-            cf = cashflows[t]
-            prev_wealth = wealth[t-1, :]
+            w_prev = wealth[t-1, :]
+            # np.where 中避免重複運算，將加法提出去
+            wealth[t, :] = np.where(w_prev > 0, w_prev * M[t, :], w_prev) + cashflows[t]
             
-            wealth[t, :] = np.where(
-                prev_wealth > 0,
-                prev_wealth * (1 + portfolio_returns[t, :]) + cf,
-                prev_wealth + cf
-            )
         return wealth
 
     def run(self):
