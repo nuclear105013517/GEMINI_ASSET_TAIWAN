@@ -5,7 +5,7 @@ import plotly.graph_objects as go
 import numpy as np
 
 # ==========================================
-# 1. 核心量化模型：資產負債與蒙地卡羅引擎 (經極限向量化優化)
+# 1. 核心量化模型：資產負債與蒙地卡羅引擎 (支援定期定額與動態提領)
 # ==========================================
 class LifeFinancialALM:
     """
@@ -20,13 +20,11 @@ class LifeFinancialALM:
 
     def generate_base_cashflows(self):
         """產生基礎通膨與現金流，並納入台灣勞退帳戶精算 (純向量化計算)"""
-        # 1. 基礎通膨與收支
         inflation_mult = (1 + self.p['通膨率']) ** np.arange(self.N_years)
         salary = np.where(self.ages <= self.p['退休年齡'], self.p['月薪'] * 12 * inflation_mult, 0)
         expenses = self.p['月開銷'] * 12 * inflation_mult
         rent = self.p['月房租'] * 12 * inflation_mult
         
-        # 2. 勞退帳戶精算模組 (完全向量化消除迴圈)
         pension_cf_net = np.zeros(self.N_years)
         idx_retire = max(0, self.p['退休年齡'] - self.p['起始年齡']) if self.p['退休年齡'] in self.ages else 0
         
@@ -34,7 +32,6 @@ class LifeFinancialALM:
         current_pension = self.p['勞退目前提撥']
         
         if idx_retire > 0:
-            # 數學封閉解：計算隨通膨遞增之年金終值 (FV of Growing Annuity)
             contributions = self.p['勞退每月提撥'] * 12 * inflation_mult[:idx_retire]
             compound_factors = (1 + pension_return) ** np.arange(idx_retire - 1, -1, -1)
             accumulated_contributions = np.sum(contributions * compound_factors)
@@ -48,9 +45,7 @@ class LifeFinancialALM:
             else:
                 payout_annual = current_pension / payout_years
                 
-            self.payout_annual = payout_annual  # 紀錄於物件屬性中供外部存取
-            
-            # 利用 Boolean Masking 進行區間賦值，消除迴圈
+            self.payout_annual = payout_annual
             mask_payout = (self.ages >= self.p['退休年齡']) & (self.ages <= 84)
             pension_cf_net[mask_payout] = payout_annual
             
@@ -59,11 +54,9 @@ class LifeFinancialALM:
             pension_cf_net[idx_retire] = current_pension
 
         net_cashflow_renting = salary - expenses - rent + pension_cf_net
-        
         return net_cashflow_renting, rent, inflation_mult
 
     def generate_personal_loan_schedule(self):
-        """計算現有銀行貸款(信貸/車貸)攤還：封閉解向量化"""
         balance = self.p['信貸餘額']
         annual_rate = self.p['信貸利率']
         total_years = self.p['信貸年限']
@@ -77,7 +70,6 @@ class LifeFinancialALM:
         monthly_rate = annual_rate / 12
         months = total_years * 12
         
-        # 年金現值公式
         if monthly_rate > 0:
             monthly_pmt = balance * (monthly_rate * (1 + monthly_rate)**months) / ((1 + monthly_rate)**months - 1)
         else:
@@ -101,7 +93,6 @@ class LifeFinancialALM:
         return yearly_pmt, remaining_principal
 
     def generate_mortgage_schedule(self):
-        """計算房貸攤還：利用封閉解進行徹底的 NumPy 向量化"""
         loan_amount = self.p['房價'] - self.p['頭期款']
         annual_rate = self.p['房貸利率']
         total_years = self.p['房貸年限']
@@ -144,15 +135,12 @@ class LifeFinancialALM:
         return yearly_pmt, remaining_principal, loan_amount
 
     def build_scenarios(self):
-        """建構所有情境的現金流與非流動資產 (整合信貸/車貸)"""
         cf_renting, rent_array, _ = self.generate_base_cashflows()
         
-        # 1. 扣除剛性消費性貸款 (信貸/車貸)
         pl_pmt, pl_bal = self.generate_personal_loan_schedule()
         cf_renting -= pl_pmt
         cf_buying = np.copy(cf_renting)
         
-        # 2. 建構房產與房貸模組
         property_value = np.zeros(self.N_years)
         mortgage_balance = np.zeros(self.N_years)
         yearly_mortgage_pmt, remaining_principal, loan_amount = self.generate_mortgage_schedule()
@@ -174,40 +162,63 @@ class LifeFinancialALM:
         return cf_renting, cf_buying, property_value, mortgage_balance, yearly_mortgage_pmt, pl_pmt, pl_bal
 
     def simulate_wealth_mc(self, cashflows, is_investing=True):
-        """量化蒙地卡羅投資模擬 (處理破產路徑依賴)"""
+        """重新設計：分離投資部位與現金部位，精準模擬 SIP 定期定額與自動變賣生活費邏輯"""
         wealth = np.zeros((self.N_years, self.N_paths))
-        wealth[0, :] = self.p['起始資金'] + self.p['現有投資'] + cashflows[0]
+        inv_wealth = np.zeros((self.N_years, self.N_paths))
+        cash_wealth = np.zeros((self.N_years, self.N_paths))
+        
+        # 初始化第 0 年
+        inv_wealth[0, :] = self.p['現有投資']
+        cash_wealth[0, :] = self.p['起始資金'] + cashflows[0]
+        wealth[0, :] = inv_wealth[0, :] + cash_wealth[0, :]
         
         if is_investing:
-            # 採用 standard_normal 提升隨機矩陣生成效能
             Z = np.random.standard_normal((self.N_years, self.N_paths))
-            mu = self.p['預期報酬'] * self.p['投資比例']
-            sigma = self.p['預期波動率'] * self.p['投資比例']
-            # 預先計算幾何布朗運動的乘數，移出迴圈
+            mu = self.p['預期報酬']
+            sigma = self.p['預期波動率']
             M = np.exp((mu - (sigma**2)/2) + sigma * Z)
+            annual_inv = self.p['每月投資'] * 12
         else:
             M = np.ones((self.N_years, self.N_paths))
-        
-        # 狀態依賴(State-dependent)漂移率：需保留時間維度迭代，但對 N_paths 進行極限向量化
-        for t in range(1, self.N_years):
-            w_prev = wealth[t-1, :]
-            # np.where 中避免重複運算，將加法提出去
-            wealth[t, :] = np.where(w_prev > 0, w_prev * M[t, :], w_prev) + cashflows[t]
+            annual_inv = 0.0
             
-        return wealth
+        for t in range(1, self.N_years):
+            prev_inv = inv_wealth[t-1, :]
+            prev_cash = cash_wealth[t-1, :]
+            
+            # 1. 投資部位隨市場波動，現金部位加上當年度收支
+            current_inv = prev_inv * M[t, :]
+            current_cash = prev_cash + cashflows[t]
+            
+            total_w = current_inv + current_cash
+            
+            # 2. 定期定額與自動提領機制 (Rebalancing / SIP)
+            # 期望目標投資額 = 目前市值 + 今年預計投入
+            desired_inv = current_inv + annual_inv
+            
+            # 向量化動態調整：若總資產 > 0，最多只能投資總資產 (現金不足時自動下修投資部位，等同賣股補貼生活)
+            # 若總資產 <= 0 (破產)，投資歸 0，負債由現金部位記帳
+            new_inv = np.where(total_w > 0, np.clip(desired_inv, 0, total_w), 0)
+            new_cash = total_w - new_inv
+            
+            inv_wealth[t, :] = new_inv
+            cash_wealth[t, :] = new_cash
+            wealth[t, :] = total_w
+            
+        return wealth, inv_wealth
 
     def run(self):
-        """執行完整模型並回傳統計結果與風險指標"""
         cf_rent, cf_buy, prop_val, mort_bal, mort_pmt, pl_pmt, pl_bal = self.build_scenarios()
         
-        # 1. 執行流動性模擬 (Liquidity Simulation)
-        mc_rent_invest = self.simulate_wealth_mc(cf_rent, is_investing=True)
-        mc_buy_invest = self.simulate_wealth_mc(cf_buy, is_investing=True)
+        # 1. 執行流動性模擬，同時抽取出「實際投資部位市值 (inv_amt)」
+        mc_rent_invest, mc_rent_inv_amt = self.simulate_wealth_mc(cf_rent, is_investing=True)
+        mc_buy_invest, mc_buy_inv_amt = self.simulate_wealth_mc(cf_buy, is_investing=True)
         
-        det_rent_no_invest = self.simulate_wealth_mc(cf_rent, is_investing=False)[:, 0]
-        det_buy_no_invest = self.simulate_wealth_mc(cf_buy, is_investing=False)[:, 0]
+        det_rent_no_invest, _ = self.simulate_wealth_mc(cf_rent, is_investing=False)
+        det_buy_no_invest, _ = self.simulate_wealth_mc(cf_buy, is_investing=False)
+        det_rent_no_invest = det_rent_no_invest[:, 0]
+        det_buy_no_invest = det_buy_no_invest[:, 0]
         
-        # 2. 計算真實淨資產 (Net Worth = 流動資產 + 房產市值 - 房貸餘額 - 信貸車貸餘額)
         mc_rent_net_worth = mc_rent_invest - pl_bal[:, None]
         mc_buy_net_worth = mc_buy_invest + prop_val[:, None] - mort_bal[:, None] - pl_bal[:, None]
         
@@ -227,11 +238,10 @@ class LifeFinancialALM:
         results['買房投資_P5'] = np.percentile(mc_buy_net_worth, 5, axis=1)
         results['買房投資_P95'] = np.percentile(mc_buy_net_worth, 95, axis=1)
 
-        # 隱藏儲存「純流動資產」中位數，專供投資孳息精算使用
-        results['純租流動_中位數'] = np.median(mc_rent_invest, axis=1)
-        results['買房流動_中位數'] = np.median(mc_buy_invest, axis=1)
+        # 隱藏儲存「實際在市場中的投資部位」中位數，專供投資孳息精算使用
+        results['純租投資部位_中位數'] = np.median(mc_rent_inv_amt, axis=1)
+        results['買房投資部位_中位數'] = np.median(mc_buy_inv_amt, axis=1)
         
-        # 3. 風險指標：破產判定基準依然是「流動性 (Liquidity) < 0」，而非淨資產 < 0
         target_age = 65 if 65 in self.ages else self.ages[-1]
         idx_target = np.where(self.ages == target_age)[0][0]
         
@@ -244,7 +254,6 @@ class LifeFinancialALM:
             'buy_inv_end': np.mean(np.any(mc_buy_invest < 0, axis=0)) * 100
         }
         
-        # 最大回撤 (MDD) 以真實淨資產計算
         def calc_median_mdd(net_worth_paths, end_idx):
             paths_subset = net_worth_paths[:end_idx+1, :]
             peaks = np.maximum.accumulate(paths_subset, axis=0)
@@ -298,10 +307,10 @@ with st.sidebar:
     
     st.markdown("---")
     st.subheader("📊 投資市場動態")
-    p_inv_ratio = st.slider("總資金配置投資比例 (%)", 0, 100, 70, 5) / 100.0
-    p_return = st.number_input("預期年化報酬率 (μ) (%)", value=7.0, step=0.5) / 100.0
-    p_volatility = st.number_input("年化波動率 (σ) (%)", value=15.0, step=0.5) / 100.0
-    p_paths = st.selectbox("蒙地卡羅路徑數", options=[100, 500, 1000, 5000, 10000], index=2)
+    p_monthly_inv = st.number_input("每月投資金額 (萬元)", min_value=0.0, value=3.0, step=0.1, help="每月從現金流中扣除並投入市場的金額 (即定期定額)。若年度現金流不足以負擔此金額，系統將自動調整；若生活費不足，將自動變賣投資部位補貼。")
+    p_return = st.number_input("預期年化報酬率 (μ) (%)", value=7.0, step=0.5, help="長線投資組合的預期年化報酬率。例如：全球股票型 ETF 約 7%~9%。") / 100.0
+    p_volatility = st.number_input("年化波動率 (σ) (%)", value=15.0, step=0.5, help="反映市場震盪的風險程度。例如 S&P 500 長期歷史平均年化波動率約為 15%~18%，台股大盤約 16%~20%，全市場投資級債券約 5%~7%。") / 100.0
+    p_paths = st.selectbox("蒙地卡羅路徑數", options=[100, 500, 1000, 5000, 10000], index=2, help="模擬未來可能發生的平行宇宙數量。路徑數越高，極端風險 (P5) 與破產率的統計評估越精準，但運算時間較長。標準量化回測建議至少 1000 條以上。")
     
     st.markdown("---")
     st.subheader("🏠 購屋與貸款模組")
@@ -323,7 +332,7 @@ params = {
     '月薪': p_salary, '月開銷': p_expense, '月房租': p_rent,
     '勞退目前提撥': p_pension_current, '勞退每月提撥': p_pension_monthly, '勞退報酬率': p_pension_return,
     '信貸餘額': p_pl_balance, '信貸年限': p_pl_years, '信貸利率': p_pl_rate,
-    '投資比例': p_inv_ratio, '預期報酬': p_return, '預期波動率': p_volatility, '模擬路徑數': p_paths,
+    '每月投資': p_monthly_inv, '預期報酬': p_return, '預期波動率': p_volatility, '模擬路徑數': p_paths,
     '買房年齡': p_buy_age, '房價': p_house_price, '頭期款': p_down_pmt,
     '房產年增值': p_house_appr, '房貸年限': p_loan_years, '寬限期': p_grace_years, '房貸利率': p_loan_rate
 }
@@ -338,10 +347,9 @@ target_age = 65 if 65 in df_res.index else df_res.index[-1]
 target_data = df_res.loc[target_age]
 
 # ----------------- 計算 65 歲預期投資孳息 -----------------
-# 投資組合年孳息 = 實際投入市場之流動資金 * 預期年化報酬率(μ) * 投資比例
-exp_yield_rate = p_return * p_inv_ratio
-rent_inv_return = target_data['純租流動_中位數'] * exp_yield_rate
-buy_inv_return = target_data['買房流動_中位數'] * exp_yield_rate
+# 投資組合年孳息 = 實際在市場中的投資部位市值 * 預期年化報酬率(μ)
+rent_inv_return = target_data['純租投資部位_中位數'] * p_return
+buy_inv_return = target_data['買房投資部位_中位數'] * p_return
 
 st.subheader(f"📊 {target_age}歲 財務健康度總覽 (淨資產與流動性風險)")
 
