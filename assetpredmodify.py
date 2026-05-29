@@ -164,14 +164,13 @@ class LifeFinancialALM:
             property_value[idx_buy:] = self.p['房價'] * appreciation[idx_buy:]
             mortgage_balance[idx_buy:idx_end] = remaining_principal[:loan_length]
 
-            # 【量化修正】導入房產真實持有與折舊成本 (CapEx)，並隨通膨指數化遞增，真實反映修繕與稅賦壓力
+            # 導入房產真實持有與折舊成本 (CapEx)，隨通膨指數化遞增
             property_holding_costs = property_value * 0.005 * self.inflation_mult
             cf_buying -= property_holding_costs
 
         return cf_renting, cf_buying, property_value, mortgage_balance, yearly_mortgage_pmt, pl_pmt, pl_bal
 
     def simulate_wealth_mc(self, cashflows, is_investing=True):
-        """重新設計：分離投資部位與現金部位，精準模擬 SIP 定期定額與自動變賣生活費邏輯"""
         wealth = np.zeros((self.N_years, self.N_paths))
         inv_wealth = np.zeros((self.N_years, self.N_paths))
         cash_wealth = np.zeros((self.N_years, self.N_paths))
@@ -196,19 +195,15 @@ class LifeFinancialALM:
             prev_inv = inv_wealth[t-1, :]
             prev_cash = cash_wealth[t-1, :]
             
-            # 【量化修正】現金部位若為正，享有基礎無風險收益；若為負，承擔信貸懲罰利率 (赤字流動性溢價)
+            # 現金部位若為正享有活存收益；若透支則承擔赤字流動性溢價
             prev_cash = np.where(prev_cash > 0, prev_cash * (1 + self.cash_rate), prev_cash * (1 + penalty_rate))
             
-            # 1. 投資部位隨市場波動，現金部位加上當年度收支
             current_inv = prev_inv * M[t, :]
             current_cash = prev_cash + cashflows[t]
-            
             total_w = current_inv + current_cash
             
-            # 2. 定期定額與自動提領機制 (Rebalancing / SIP)
             desired_inv = current_inv + annual_inv_array[t]
             
-            # 向量化動態調整：若總資產 > 0，最多只能投資總資產 (現金不足時自動下修投資部位，等同賣股補貼生活)
             new_inv = np.where(total_w > 0, np.clip(desired_inv, 0, total_w), 0)
             new_cash = total_w - new_inv
             
@@ -221,7 +216,6 @@ class LifeFinancialALM:
     def run(self):
         cf_rent, cf_buy, prop_val, mort_bal, mort_pmt, pl_pmt, pl_bal = self.build_scenarios()
         
-        # 1. 執行流動性模擬，抽取出「實際投資部位市值 (inv_amt)」與「總流動資產 (total_wealth)」
         mc_rent_total_wealth, mc_rent_inv_amt = self.simulate_wealth_mc(cf_rent, is_investing=True)
         mc_buy_total_wealth, mc_buy_inv_amt = self.simulate_wealth_mc(cf_buy, is_investing=True)
         
@@ -250,7 +244,6 @@ class LifeFinancialALM:
         results['買房投資_P5'] = np.percentile(mc_buy_net_worth, 5, axis=1)
         results['買房投資_P95'] = np.percentile(mc_buy_net_worth, 95, axis=1)
 
-        # 隱藏儲存「實際在市場中的投資部位」中位數，專供投資孳息精算使用
         results['純租投資部位_中位數'] = np.median(mc_rent_inv_amt, axis=1)
         results['買房投資部位_中位數'] = np.median(mc_buy_inv_amt, axis=1)
         
@@ -271,7 +264,7 @@ class LifeFinancialALM:
             paths_subset = net_worth_paths[:end_idx+1, :]
             peaks = np.maximum.accumulate(paths_subset, axis=0)
             with np.errstate(divide='ignore', invalid='ignore'):
-                # 【量化修正】確保 peak > 0 時才計算回撤，避免淨資產為負時的數學奇異點
+                # 數學除錯優化：防範淨資產為零時的除法無效，確保 MDD 衡量真實波動
                 drawdowns = np.where(peaks > 0, (paths_subset - peaks) / peaks, 0)
             drawdowns = np.clip(drawdowns, -1, 0)
             max_drawdowns = np.min(drawdowns, axis=0)
@@ -328,7 +321,7 @@ with st.sidebar:
     
     st.markdown("---")
     st.subheader("🏠 購屋與貸款模組")
-    p_buy_age = st.number_input("預計買房年齡", min_value=p_age, max_value=80, value=70, step=1)
+    p_buy_age = st.number_input("預計買房年齡", min_value=p_age, max_value=80, value=60, step=1)
     p_house_price = st.number_input("房屋總價 (萬元)", min_value=100, value=1500, step=100)
     p_down_pmt = st.number_input("頭期款 (萬元)", min_value=100, value=300, step=50)
     
@@ -361,7 +354,6 @@ target_age = 65 if 65 in df_res.index else df_res.index[-1]
 target_data = df_res.loc[target_age]
 
 # ----------------- 計算 65 歲預期投資孳息 -----------------
-# 投資組合年孳息 = 實際在市場中的投資部位市值 * 預期年化報酬率(μ)
 rent_inv_return = target_data['純租投資部位_中位數'] * p_return
 buy_inv_return = target_data['買房投資部位_中位數'] * p_return
 
@@ -399,13 +391,11 @@ st.markdown("實線為**純儲蓄（無投資）**之基準；虛線為市場動
 
 fig_nw = go.Figure()
 
-# 買房情境
 fig_nw.add_trace(go.Scatter(x=df_res['年齡'], y=df_res['買房投資_P95'], mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'))
 fig_nw.add_trace(go.Scatter(x=df_res['年齡'], y=df_res['買房投資_P5'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(52, 199, 89, 0.2)', name='買房+投資 (90% 區間)'))
 fig_nw.add_trace(go.Scatter(x=df_res['年齡'], y=df_res['買房投資_中位數'], mode='lines', line=dict(color='#34C759', width=3, dash='dash'), name='買房+投資 (中位數)'))
 fig_nw.add_trace(go.Scatter(x=df_res['年齡'], y=df_res['買房_無投資'], mode='lines', line=dict(color='#FF3B30', width=3), name='買房純儲蓄'))
 
-# 純租情境
 fig_nw.add_trace(go.Scatter(x=df_res['年齡'], y=df_res['純租投資_P95'], mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'))
 fig_nw.add_trace(go.Scatter(x=df_res['年齡'], y=df_res['純租投資_P5'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(0, 122, 255, 0.2)', name='純租+投資 (90% 區間)'))
 fig_nw.add_trace(go.Scatter(x=df_res['年齡'], y=df_res['純租投資_中位數'], mode='lines', line=dict(color='#007AFF', width=3, dash='dash'), name='純租+投資 (中位數)'))
@@ -441,11 +431,11 @@ with st.expander("📝 量化專家診斷報告 (點擊展開)", expanded=True):
     st.write(f"""
     ### 深度量化診斷結果
     
-    | 診斷維度 | 量化回測事實 | 財務意義 |
+    | 診斷維度 | 量化回測事實 | 財務意義與精算洞察 |
     | :--- | :--- | :--- |
-    | **破產風險評估 <br> (Probability of Ruin)** | 終老純租破產率：**{ruin_probs['rent_inv_end']:.1f}%** <br> 終老買房破產率：**{ruin_probs['buy_inv_end']:.1f}%** | 嚴格依循路徑依賴演算法，生命週期中「流動性跌破 0」即觸發實質違約。買房情境在寬限期結束後的現金流斷層，是誘發流動性危機的最大震央。 |
-    | **最大回撤與波動 <br> (Max Drawdown)** | 買房投資 MDD：**-{mdd_stats['buy_mdd']:.1f}%** <br> 純租投資 MDD：**-{mdd_stats['rent_mdd']:.1f}%** | 純租情境的淨資產完全暴露於市場波動風險；而買房情境藉由低波動實體資產（年增值 {p_house_appr*100:.1f}%），實質上提供了投資組合下檔保護。 |
-    | **長壽風險與勞退 <br> (Longevity & Pension)** | 65-84歲勞退(年)：**{model.payout_annual:.1f} 萬** <br> 65歲後預期投資孳息(年)：**純租 {rent_inv_return:.1f} 萬 / 買房 {buy_inv_return:.1f} 萬** | 依台灣勞退新制規定，月領年金精算至 84 歲為止。圖表 2 中可明顯觀察到 **85 歲的二次現金流斷崖**，此後將大幅考驗自身投資組合的抗摔能力。 |
-    | **房產槓桿與流動性 <br> (Real Estate Leverage)** | 房貸年付 (攤還期)：**{np.max(mort_pmt):.1f} 萬** <br> 房貸總年限：**{p_loan_years} 年** | 房產雖具備抗通膨與強制儲蓄特性，但本息攤還將大幅排擠定期的「每月投資金額」。若遇市場長期空頭且逢寬限期結束，房貸的剛性支出將嚴重侵蝕剩餘現金流。 |
-    | **消費負債拖累 <br> (Consumer Debt Drag)** | 銀行貸款年付：**{pl_pmt[0]:.1f} 萬** <br> 貸款剩餘年限：**{p_pl_years} 年** | 剛性債務（信貸/車貸）將在初期產生「現金流拖累」。由於淨資產計算中已嚴格扣除此負債，若其貸款利率大於投資組合底層期望值，將顯著放大早夭期的流動性違約風險。 |
+    | **破產風險評估 <br> (Probability of Ruin)** | 終老純租破產率：**{ruin_probs['rent_inv_end']:.1f}%** <br> 終老買房破產率：**{ruin_probs['buy_inv_end']:.1f}%** | 導入動態現金流折現與路徑相依（Path-Dependency）特性，當「總流動資產（現金+投資）跌破 0」即觸發實質破產違約。買房情境中，寬限期結束後的「本息攤還斷層」往往是誘發中期流動枯竭的最大震央，務必預留流動性緩衝。 |
+    | **最大回撤與波動 <br> (Max Drawdown)** | 買房淨資產 MDD：**-{mdd_stats['buy_mdd']:.1f}%** <br> 純租淨資產 MDD：**-{mdd_stats['rent_mdd']:.1f}%** | 此 MDD 衡量「總真實淨資產」自高點滑落的極端幅度。純租情境之淨資產高度集中於金融市場，故完全承受市場系統性風險（Beta）；買房情境則因持有具備穩定資本增值的實體抗通膨資產（年化 {p_house_appr*100:.1f}%），在數學上產生了「波動阻尼（Volatility Damping）」效應，為總淨資產提供實質的下檔保護（Downside Protection）。 |
+    | **長壽風險與勞退 <br> (Longevity & Pension)** | 65-84歲勞退(年)：**{model.payout_annual:.1f} 萬** <br> 65歲後預期投資孳息(年)：**純租 {rent_inv_return:.1f} 萬 / 買房 {buy_inv_return:.1f} 萬** | 整合台灣勞退新制精算邊界，年金化給付預設至 84 歲終止。由圖表 2 的軌跡可明確觀測到「85 歲二次現金流斷崖（Cash Flow Cliff）」，此階段起將完全依賴金融部位的「投資孳息」與「本金消耗」支應長尾存續期，嚴峻考驗尾部資產的抗震能力。 |
+    | **房產槓桿與流動性 <br> (Real Estate Leverage)** | 房貸年付 (攤還期)：**{np.max(mort_pmt):.1f} 萬** <br> 房貸總年限：**{p_loan_years} 年** | 房地產本質為「附帶強制儲蓄與抗通膨屬性的高度財務槓桿」。鉅額的本息攤還會產生排擠效應，壓縮「每月定期定額（SIP）」的資本投入。若逢寬限期屆滿且市場步入長期空頭（Prolonged Bear Market），剛性的房貸現金流出將嚴重侵蝕整體流動性水位。 |
+    | **消費負債拖累 <br> (Consumer Debt Drag)** | 銀行貸款年付：**{pl_pmt[0]:.1f} 萬** <br> 貸款剩餘年限：**{p_pl_years} 年** | 剛性消費型債務（如信貸/車貸）在模型初期即構成「結構性現金流拖累（Cash Flow Drag）」。若該負債之實質利率（{p_pl_rate*100:.1f}%）高於投資組合的長期預期報酬率，將形成「負利差（Negative Carry）」，並透過時間複利指數化放大早夭期的流動性違約機率。 |
     """)
