@@ -164,8 +164,8 @@ class LifeFinancialALM:
             property_value[idx_buy:] = self.p['房價'] * appreciation[idx_buy:]
             mortgage_balance[idx_buy:idx_end] = remaining_principal[:loan_length]
 
-            # 導入房產真實持有與折舊成本 (CapEx)，隨通膨指數化遞增
-            property_holding_costs = property_value * 0.005 * self.inflation_mult
+            # 【量化修正】取消乘上 inflation_mult，直接取房產市值的 0.5% 作為真實 CapEx (市價本身已隱含抗通膨增值)
+            property_holding_costs = property_value * 0.005
             cf_buying -= property_holding_costs
 
         return cf_renting, cf_buying, property_value, mortgage_balance, yearly_mortgage_pmt, pl_pmt, pl_bal
