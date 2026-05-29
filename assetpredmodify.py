@@ -18,13 +18,10 @@ class LifeFinancialALM:
         self.N_paths = self.p.get('模擬路徑數', 1000)
         self.payout_annual = 0.0  
         
-        # 【量化修正】將通膨乘數提取為實體屬性，供全域 ALM 計算使用
         self.inflation_mult = (1 + self.p['通膨率']) ** np.arange(self.N_years)
-        # 【量化修正】無風險活存/流動性資金利率 (預設 1%)，避免閒置資金估值低估
         self.cash_rate = 0.01
 
     def generate_base_cashflows(self):
-        """產生基礎通膨與現金流，並納入台灣勞退帳戶精算 (純向量化計算)"""
         salary = np.where(self.ages <= self.p['退休年齡'], self.p['月薪'] * 12 * self.inflation_mult, 0)
         expenses = self.p['月開銷'] * 12 * self.inflation_mult
         rent = self.p['月房租'] * 12 * self.inflation_mult
@@ -41,7 +38,6 @@ class LifeFinancialALM:
             accumulated_contributions = np.sum(contributions * compound_factors)
             current_pension = current_pension * ((1 + pension_return) ** idx_retire) + accumulated_contributions
             
-        # 【量化修正】邊界條件保護：避免退休年齡 >= 84 歲時發生除以零或負數年限的錯誤
         payout_years = max(1, 84 - self.p['退休年齡'])
         
         if self.p['退休年齡'] <= 84 and current_pension > 0:
@@ -164,7 +160,6 @@ class LifeFinancialALM:
             property_value[idx_buy:] = self.p['房價'] * appreciation[idx_buy:]
             mortgage_balance[idx_buy:idx_end] = remaining_principal[:loan_length]
 
-            # 【量化修正】取消乘上 inflation_mult，直接取房產市值的 0.5% 作為真實 CapEx (市價本身已隱含抗通膨增值)
             property_holding_costs = property_value * 0.005
             cf_buying -= property_holding_costs
 
@@ -181,9 +176,11 @@ class LifeFinancialALM:
         
         if is_investing:
             Z = np.random.standard_normal((self.N_years, self.N_paths))
-            mu = self.p['預期報酬']
+            # 【量化修正】將簡單報酬轉換為連續對數報酬 (Log Return) 避免期望值漂移
+            mu_simple = self.p['預期報酬']
+            mu_log = np.log(1 + mu_simple) 
             sigma = self.p['預期波動率']
-            M = np.exp((mu - (sigma**2)/2) + sigma * Z)
+            M = np.exp((mu_log - (sigma**2)/2) + sigma * Z)
             annual_inv_array = self.p['每月投資'] * 12 * self.inflation_mult
         else:
             M = np.ones((self.N_years, self.N_paths))
@@ -195,7 +192,6 @@ class LifeFinancialALM:
             prev_inv = inv_wealth[t-1, :]
             prev_cash = cash_wealth[t-1, :]
             
-            # 現金部位若為正享有活存收益；若透支則承擔赤字流動性溢價
             prev_cash = np.where(prev_cash > 0, prev_cash * (1 + self.cash_rate), prev_cash * (1 + penalty_rate))
             
             current_inv = prev_inv * M[t, :]
@@ -224,33 +220,10 @@ class LifeFinancialALM:
         det_rent_no_invest = det_rent_no_invest_total[:, 0]
         det_buy_no_invest = det_buy_no_invest_total[:, 0]
         
-        # 真實淨資產 = 總流動資產 (現金+投資) + 實體資產 - 負債本金
-        mc_rent_net_worth = mc_rent_total_wealth - pl_bal[:, None]
-        mc_buy_net_worth = mc_buy_total_wealth + prop_val[:, None] - mort_bal[:, None] - pl_bal[:, None]
-        
-        results = pd.DataFrame(index=self.ages)
-        results['年齡'] = self.ages
-        results['純租_現金流'] = cf_rent
-        results['買房_現金流'] = cf_buy
-        
-        results['純租_無投資'] = det_rent_no_invest - pl_bal
-        results['買房_無投資'] = det_buy_no_invest + prop_val - mort_bal - pl_bal
-        
-        results['純租投資_中位數'] = np.median(mc_rent_net_worth, axis=1)
-        results['純租投資_P5'] = np.percentile(mc_rent_net_worth, 5, axis=1)
-        results['純租投資_P95'] = np.percentile(mc_rent_net_worth, 95, axis=1)
-        
-        results['買房投資_中位數'] = np.median(mc_buy_net_worth, axis=1)
-        results['買房投資_P5'] = np.percentile(mc_buy_net_worth, 5, axis=1)
-        results['買房投資_P95'] = np.percentile(mc_buy_net_worth, 95, axis=1)
-
-        results['純租投資部位_中位數'] = np.median(mc_rent_inv_amt, axis=1)
-        results['買房投資部位_中位數'] = np.median(mc_buy_inv_amt, axis=1)
-        
         target_age = 65 if 65 in self.ages else self.ages[-1]
         idx_target = np.where(self.ages == target_age)[0][0]
         
-        # 破產定義：生命週期中「總流動資產 (total_wealth) < 0」即視為實質違約
+        # 破產定義：生命週期中「名目流動資產 < 0」即視為實質違約 (保持名目計算)
         ruin_probs = {
             'buy_inv_65': np.mean(np.any(mc_buy_total_wealth[:idx_target+1, :] < 0, axis=0)) * 100,
             'rent_inv_65': np.mean(np.any(mc_rent_total_wealth[:idx_target+1, :] < 0, axis=0)) * 100,
@@ -260,19 +233,44 @@ class LifeFinancialALM:
             'buy_inv_end': np.mean(np.any(mc_buy_total_wealth < 0, axis=0)) * 100
         }
         
+        # 【量化修正】將輸出報表陣列除以通膨乘數，轉換為「實質購買力 (Real Value)」消除貨幣幻覺
+        inf_discount_1d = self.inflation_mult
+        inf_discount_2d = self.inflation_mult[:, None]
+
+        mc_rent_net_worth_real = (mc_rent_total_wealth - pl_bal[:, None]) / inf_discount_2d
+        mc_buy_net_worth_real = (mc_buy_total_wealth + prop_val[:, None] - mort_bal[:, None] - pl_bal[:, None]) / inf_discount_2d
+
+        results = pd.DataFrame(index=self.ages)
+        results['年齡'] = self.ages
+        results['純租_現金流'] = cf_rent / inf_discount_1d
+        results['買房_現金流'] = cf_buy / inf_discount_1d
+        
+        results['純租_無投資'] = (det_rent_no_invest - pl_bal) / inf_discount_1d
+        results['買房_無投資'] = (det_buy_no_invest + prop_val - mort_bal - pl_bal) / inf_discount_1d
+        
+        results['純租投資_中位數'] = np.median(mc_rent_net_worth_real, axis=1)
+        results['純租投資_P5'] = np.percentile(mc_rent_net_worth_real, 5, axis=1)
+        results['純租投資_P95'] = np.percentile(mc_rent_net_worth_real, 95, axis=1)
+        
+        results['買房投資_中位數'] = np.median(mc_buy_net_worth_real, axis=1)
+        results['買房投資_P5'] = np.percentile(mc_buy_net_worth_real, 5, axis=1)
+        results['買房投資_P95'] = np.percentile(mc_buy_net_worth_real, 95, axis=1)
+
+        results['純租投資部位_中位數'] = np.median(mc_rent_inv_amt, axis=1) / inf_discount_1d
+        results['買房投資部位_中位數'] = np.median(mc_buy_inv_amt, axis=1) / inf_discount_1d
+        
         def calc_median_mdd(net_worth_paths, end_idx):
             paths_subset = net_worth_paths[:end_idx+1, :]
             peaks = np.maximum.accumulate(paths_subset, axis=0)
             with np.errstate(divide='ignore', invalid='ignore'):
-                # 數學除錯優化：防範淨資產為零時的除法無效，確保 MDD 衡量真實波動
                 drawdowns = np.where(peaks > 0, (paths_subset - peaks) / peaks, 0)
             drawdowns = np.clip(drawdowns, -1, 0)
             max_drawdowns = np.min(drawdowns, axis=0)
             return abs(np.median(max_drawdowns)) * 100
 
         mdd_stats = {
-            'buy_mdd': calc_median_mdd(mc_buy_net_worth, idx_target),
-            'rent_mdd': calc_median_mdd(mc_rent_net_worth, idx_target)
+            'buy_mdd': calc_median_mdd(mc_buy_net_worth_real, idx_target), # MDD 使用實質購買力評估更精準
+            'rent_mdd': calc_median_mdd(mc_rent_net_worth_real, idx_target)
         }
 
         return results, mort_pmt, ruin_probs, mdd_stats, pl_pmt
@@ -287,52 +285,57 @@ st.markdown("融合**精算科學 (Actuarial Science)**與**隨機微積分 (Sto
 with st.sidebar:
     st.header("⚙️ 量化參數設定")
     
-    st.subheader("👤 基本財務")
-    p_age = st.number_input("目前年齡", min_value=20, max_value=60, value=30, step=1)
-    p_retire = st.number_input("預計退休年齡", min_value=40, max_value=80, value=65, step=1)
-    
-    p_capital = st.number_input("起始流動資金 (萬元)", min_value=0, value=100, step=10, help="目前的現金存款")
-    p_exist_invest = st.number_input("目前已投資部位 (萬元)", min_value=0, value=100, step=10, help="目前已經投入股市/基金等市場的資產")
-    
-    p_inflation = st.number_input("年通膨/薪資成長率 (%)", min_value=0.0, value=2.0, step=0.5) / 100.0
-    
-    p_salary = st.number_input("目前平均月薪 (萬元)", min_value=0.0, value=8.0, step=0.5, help="實領金額")
-    p_expense = st.number_input("目前月開銷 (萬元)", min_value=0.0, value=3.0, step=0.1)
-    p_rent = st.number_input("目前月房租 (萬元)", min_value=0.0, value=2.0, step=0.1)
-
-    st.markdown("---")
-    st.subheader("🛡️ 退休金與勞退帳戶 (台灣勞退機制)")
-    p_pension_current = st.number_input("目前已提撥勞退本金 (萬元)", min_value=0.0, value=30.0, step=10.0, help="勞退個人專戶目前累積之本金與收益")
-    p_pension_monthly = st.number_input("每月持續提撥額 (萬元)", min_value=0.0, value=0.6, step=0.1, help="含雇主6%與自提。此資金獨立累積，不扣除上方月薪之流動現金。")
-    p_pension_return = st.number_input("勞退基金保證年化報酬率 (%)", value=2.0, step=0.1) / 100.0
-    
-    st.markdown("---")
-    st.subheader("💳 現有銀行貸款 (信貸/車貸)")
-    p_pl_balance = st.number_input("目前剩餘貸款本金 (萬元)", min_value=0.0, value=0.0, step=10.0, help="例如：個人信貸、車輛貸款等剛性債務")
-    p_pl_years = st.number_input("剩餘還款年限 (年)", min_value=0, max_value=20, value=0, step=1)
-    p_pl_rate = st.number_input("貸款年利率 (%)", min_value=0.0, value=3.0, step=0.1) / 100.0
-    
-    st.markdown("---")
-    st.subheader("📊 投資市場動態")
-    p_monthly_inv = st.number_input("每月投資金額 (萬元)", min_value=0.0, value=3.0, step=0.1, help="每月從現金流中扣除並投入市場的金額 (即定期定額)。若年度現金流不足以負擔此金額，系統將自動調整；若生活費不足，將自動變賣投資部位補貼。")
-    p_return = st.number_input("預期年化報酬率 (μ) (%)", value=7.0, step=0.5, help="長線投資組合的預期年化報酬率。例如：全球股票型 ETF 約 7%~9%。") / 100.0
-    p_volatility = st.number_input("年化波動率 (σ) (%)", value=15.0, step=0.5, help="反映市場震盪的風險程度。例如 S&P 500 長期歷史平均年化波動率約為 15%~18%，台股大盤約 16%~20%，全市場投資級債券約 5%~7%。") / 100.0
-    p_paths = st.selectbox("蒙地卡羅路徑數", options=[100, 500, 1000, 5000, 10000], index=2, help="模擬未來可能發生的平行宇宙數量。路徑數越高，極端風險 (P5) 與破產率的統計評估越精準，但運算時間較長。標準量化回測建議至少 1000 條以上。")
-    
-    st.markdown("---")
-    st.subheader("🏠 購屋與貸款模組")
-    p_buy_age = st.number_input("預計買房年齡", min_value=p_age, max_value=80, value=60, step=1)
-    p_house_price = st.number_input("房屋總價 (萬元)", min_value=100, value=1500, step=100)
-    p_down_pmt = st.number_input("頭期款 (萬元)", min_value=100, value=300, step=50)
-    
-    col_a, col_b = st.columns(2)
-    with col_a:
-        p_loan_years = st.number_input("房貸年限", value=30, step=1)
-    with col_b:
-        p_grace_years = st.number_input("寬限期", min_value=0, max_value=10, value=3, step=1)
+    # 【量化修正】導入 st.form 阻斷 Streamlit 自動重算，優化 UI 效能
+    with st.form("quant_params_form"):
+        st.subheader("👤 基本財務")
+        p_age = st.number_input("目前年齡", min_value=20, max_value=60, value=32, step=1)
+        p_retire = st.number_input("預計退休年齡", min_value=40, max_value=80, value=65, step=1)
         
-    p_loan_rate = st.number_input("房貸利率 (%)", value=2.1, step=0.1) / 100.0
-    p_house_appr = st.number_input("房產年增值率 (%)", value=1.5, step=0.1) / 100.0
+        p_capital = st.number_input("起始流動資金 (萬元)", min_value=0, value=100, step=10, help="目前的現金存款")
+        p_exist_invest = st.number_input("目前已投資部位 (萬元)", min_value=0, value=100, step=10, help="目前已經投入股市/基金等市場的資產")
+        
+        p_inflation = st.number_input("年通膨/薪資成長率 (%)", min_value=0.0, value=2.0, step=0.5) / 100.0
+        
+        p_salary = st.number_input("目前平均月薪 (萬元)", min_value=0.0, value=8.0, step=0.5, help="實領金額")
+        p_expense = st.number_input("目前月開銷 (萬元)", min_value=0.0, value=3.0, step=0.1)
+        p_rent = st.number_input("目前月房租 (萬元)", min_value=0.0, value=2.0, step=0.1)
+
+        st.markdown("---")
+        st.subheader("🛡️ 退休金與勞退帳戶 (台灣勞退機制)")
+        p_pension_current = st.number_input("目前已提撥勞退本金 (萬元)", min_value=0.0, value=30.0, step=10.0, help="勞退個人專戶目前累積之本金與收益")
+        p_pension_monthly = st.number_input("每月持續提撥額 (萬元)", min_value=0.0, value=0.6, step=0.1, help="含雇主6%與自提。此資金獨立累積，不扣除上方月薪之流動現金。")
+        p_pension_return = st.number_input("勞退基金保證年化報酬率 (%)", value=2.0, step=0.1) / 100.0
+        
+        st.markdown("---")
+        st.subheader("💳 現有銀行貸款 (信貸/車貸)")
+        p_pl_balance = st.number_input("目前剩餘貸款本金 (萬元)", min_value=0.0, value=0.0, step=10.0, help="例如：個人信貸、車輛貸款等剛性債務")
+        p_pl_years = st.number_input("剩餘還款年限 (年)", min_value=0, max_value=20, value=0, step=1)
+        p_pl_rate = st.number_input("貸款年利率 (%)", min_value=0.0, value=3.0, step=0.1) / 100.0
+        
+        st.markdown("---")
+        st.subheader("📊 投資市場動態")
+        p_monthly_inv = st.number_input("每月投資金額 (萬元)", min_value=0.0, value=3.0, step=0.1, help="每月從現金流中扣除並投入市場的金額 (即定期定額)。若年度現金流不足以負擔此金額，系統將自動調整；若生活費不足，將自動變賣投資部位補貼。")
+        p_return = st.number_input("預期年化報酬率 (μ) (%)", value=7.0, step=0.5, help="長線投資組合的預期年化報酬率。例如：全球股票型 ETF 約 7%~9%。") / 100.0
+        p_volatility = st.number_input("年化波動率 (σ) (%)", value=18.0, step=0.5, help="反映市場震盪的風險程度。例如 S&P 500 長期歷史平均年化波動率約為 15%~18%，台股大盤約 16%~20%。") / 100.0
+        p_paths = st.selectbox("蒙地卡羅路徑數", options=[100, 500, 1000, 5000, 10000], index=2, help="模擬未來可能發生的平行宇宙數量。路徑數越高，極端風險 (P5) 與破產率的統計評估越精準，但運算時間較長。標準量化回測建議至少 1000 條以上。")
+        
+        st.markdown("---")
+        st.subheader("🏠 購屋與貸款模組")
+        p_buy_age = st.number_input("預計買房年齡", min_value=20, max_value=80, value=60, step=1)
+        p_house_price = st.number_input("房屋總價 (萬元)", min_value=100, value=1500, step=100)
+        p_down_pmt = st.number_input("頭期款 (萬元)", min_value=100, value=300, step=50)
+        
+        col_a, col_b = st.columns(2)
+        with col_a:
+            p_loan_years = st.number_input("房貸年限", value=30, step=1)
+        with col_b:
+            p_grace_years = st.number_input("寬限期", min_value=0, max_value=10, value=3, step=1)
+            
+        p_loan_rate = st.number_input("房貸利率 (%)", value=2.1, step=0.1) / 100.0
+        p_house_appr = st.number_input("房產年增值率 (%)", value=1.5, step=0.1) / 100.0
+        
+        # 表單提交按鈕
+        submitted = st.form_submit_button("🚀 執行量化運算", use_container_width=True)
 
 params = {
     '起始年齡': p_age, '退休年齡': p_retire, '起始資金': p_capital, '現有投資': p_exist_invest, '通膨率': p_inflation,
@@ -348,7 +351,7 @@ model = LifeFinancialALM(params)
 df_res, mort_pmt, ruin_probs, mdd_stats, pl_pmt = model.run()
 
 # ==========================================
-# 3. 儀表板與數據視覺化 (不改變原架構)
+# 3. 儀表板與數據視覺化 (維持原架構，但底層數值已轉為實質購買力)
 # ==========================================
 target_age = 65 if 65 in df_res.index else df_res.index[-1]
 target_data = df_res.loc[target_age]
@@ -386,7 +389,7 @@ with col8:
 st.markdown("<hr>", unsafe_allow_html=True)
 
 # ----------------- 圖表 1：蒙地卡羅淨資產曲線 -----------------
-st.subheader("💰 1. 人生真實淨資產 (Net Worth) 蒙地卡羅預測")
+st.subheader("💰 1. 人生真實淨資產 (以今日購買力計) 蒙地卡羅預測")
 st.markdown("實線為**純儲蓄（無投資）**之基準；虛線為市場動態下之**中位數**，陰影區間代表 **90% 信心水準**。")
 
 fig_nw = go.Figure()
@@ -405,12 +408,12 @@ fig_nw.update_layout(
     plot_bgcolor='white', paper_bgcolor='white', hovermode="x unified",
     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     xaxis=dict(showgrid=True, gridcolor='#E5E5EA', title='年齡'),
-    yaxis=dict(showgrid=True, gridcolor='#E5E5EA', title='真實淨資產 (萬元)')
+    yaxis=dict(showgrid=True, gridcolor='#E5E5EA', title='真實淨資產 (實質購買力/萬元)')
 )
 st.plotly_chart(fig_nw, use_container_width=True)
 
 # ----------------- 圖表 2：年度收支平衡曲線 -----------------
-st.subheader("⚖️ 2. 年度淨現金流曲線 (Cash Flow Dynamics)")
+st.subheader("⚖️ 2. 年度淨現金流曲線 (實質購買力)")
 
 fig_cf = px.line(
     df_res, x='年齡', y=['純租_現金流', '買房_現金流'],
@@ -422,7 +425,7 @@ fig_cf.update_layout(
     plot_bgcolor='white', paper_bgcolor='white', hovermode="x unified",
     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     xaxis=dict(showgrid=True, gridcolor='#E5E5EA', title='年齡'),
-    yaxis=dict(showgrid=True, gridcolor='#E5E5EA', title='年度淨現金流 (萬元)')
+    yaxis=dict(showgrid=True, gridcolor='#E5E5EA', title='年度淨現金流 (實質購買力/萬元)')
 )
 st.plotly_chart(fig_cf, use_container_width=True)
 
