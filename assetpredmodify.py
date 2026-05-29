@@ -328,7 +328,7 @@ with st.sidebar:
     
     st.markdown("---")
     st.subheader("🏠 購屋與貸款模組")
-    p_buy_age = st.number_input("預計買房年齡", min_value=p_age, max_value=80, value=35, step=1)
+    p_buy_age = st.number_input("預計買房年齡", min_value=p_age, max_value=80, value=70, step=1)
     p_house_price = st.number_input("房屋總價 (萬元)", min_value=100, value=1500, step=100)
     p_down_pmt = st.number_input("頭期款 (萬元)", min_value=100, value=300, step=50)
     
