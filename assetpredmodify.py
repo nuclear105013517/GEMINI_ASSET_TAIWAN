@@ -16,9 +16,12 @@ class LifeFinancialALM:
         self.N_years = 101 - self.p['起始年齡']
         self.ages = np.arange(self.p['起始年齡'], 101)
         self.N_paths = self.p.get('模擬路徑數', 1000)
-        self.payout_annual = 0.0  # 紀錄勞退年領金額
+        self.payout_annual = 0.0  
+        
         # 【量化修正】將通膨乘數提取為實體屬性，供全域 ALM 計算使用
         self.inflation_mult = (1 + self.p['通膨率']) ** np.arange(self.N_years)
+        # 【量化修正】無風險活存/流動性資金利率 (預設 1%)，避免閒置資金估值低估
+        self.cash_rate = 0.01
 
     def generate_base_cashflows(self):
         """產生基礎通膨與現金流，並納入台灣勞退帳戶精算 (純向量化計算)"""
@@ -38,9 +41,10 @@ class LifeFinancialALM:
             accumulated_contributions = np.sum(contributions * compound_factors)
             current_pension = current_pension * ((1 + pension_return) ** idx_retire) + accumulated_contributions
             
-        payout_years = 84 - self.p['退休年齡']
+        # 【量化修正】邊界條件保護：避免退休年齡 >= 84 歲時發生除以零或負數年限的錯誤
+        payout_years = max(1, 84 - self.p['退休年齡'])
         
-        if payout_years > 0 and current_pension > 0:
+        if self.p['退休年齡'] <= 84 and current_pension > 0:
             if pension_return > 0:
                 payout_annual = current_pension * (pension_return * (1 + pension_return)**payout_years) / ((1 + pension_return)**payout_years - 1)
             else:
@@ -50,7 +54,7 @@ class LifeFinancialALM:
             mask_payout = (self.ages >= self.p['退休年齡']) & (self.ages <= 84)
             pension_cf_net[mask_payout] = payout_annual
             
-        elif payout_years <= 0 and idx_retire < self.N_years:
+        elif self.p['退休年齡'] > 84 and idx_retire < self.N_years:
             self.payout_annual = current_pension
             pension_cf_net[idx_retire] = current_pension
 
@@ -160,8 +164,8 @@ class LifeFinancialALM:
             property_value[idx_buy:] = self.p['房價'] * appreciation[idx_buy:]
             mortgage_balance[idx_buy:idx_end] = remaining_principal[:loan_length]
 
-            # 【量化修正】導入房產真實持有與折舊成本 (CapEx) 預設年化 0.5% (含稅與修繕)
-            property_holding_costs = property_value * 0.005
+            # 【量化修正】導入房產真實持有與折舊成本 (CapEx)，並隨通膨指數化遞增，真實反映修繕與稅賦壓力
+            property_holding_costs = property_value * 0.005 * self.inflation_mult
             cf_buying -= property_holding_costs
 
         return cf_renting, cf_buying, property_value, mortgage_balance, yearly_mortgage_pmt, pl_pmt, pl_bal
@@ -172,12 +176,10 @@ class LifeFinancialALM:
         inv_wealth = np.zeros((self.N_years, self.N_paths))
         cash_wealth = np.zeros((self.N_years, self.N_paths))
         
-        # 初始化第 0 年
         inv_wealth[0, :] = self.p['現有投資']
         cash_wealth[0, :] = self.p['起始資金'] + cashflows[0]
         wealth[0, :] = inv_wealth[0, :] + cash_wealth[0, :]
         
-        # 【量化修正】投資金額必須隨通膨等比擴張，避免長週期的「購買力幻覺」
         if is_investing:
             Z = np.random.standard_normal((self.N_years, self.N_paths))
             mu = self.p['預期報酬']
@@ -188,15 +190,14 @@ class LifeFinancialALM:
             M = np.ones((self.N_years, self.N_paths))
             annual_inv_array = np.zeros(self.N_years)
             
-        # 【量化修正】現金部位若為負，將承擔信貸懲罰利率 (赤字流動性溢價)
         penalty_rate = self.p.get('信貸利率', 0.03)
 
         for t in range(1, self.N_years):
             prev_inv = inv_wealth[t-1, :]
             prev_cash = cash_wealth[t-1, :]
             
-            # 懲罰透支：若上期現金為負，自動滾入債息
-            prev_cash = np.where(prev_cash < 0, prev_cash * (1 + penalty_rate), prev_cash)
+            # 【量化修正】現金部位若為正，享有基礎無風險收益；若為負，承擔信貸懲罰利率 (赤字流動性溢價)
+            prev_cash = np.where(prev_cash > 0, prev_cash * (1 + self.cash_rate), prev_cash * (1 + penalty_rate))
             
             # 1. 投資部位隨市場波動，現金部位加上當年度收支
             current_inv = prev_inv * M[t, :]
@@ -205,11 +206,9 @@ class LifeFinancialALM:
             total_w = current_inv + current_cash
             
             # 2. 定期定額與自動提領機制 (Rebalancing / SIP)
-            # 期望目標投資額 = 目前市值 + 今年預計投入(經通膨校準)
             desired_inv = current_inv + annual_inv_array[t]
             
             # 向量化動態調整：若總資產 > 0，最多只能投資總資產 (現金不足時自動下修投資部位，等同賣股補貼生活)
-            # 若總資產 <= 0 (破產)，投資歸 0，負債由現金部位記帳
             new_inv = np.where(total_w > 0, np.clip(desired_inv, 0, total_w), 0)
             new_cash = total_w - new_inv
             
@@ -272,6 +271,7 @@ class LifeFinancialALM:
             paths_subset = net_worth_paths[:end_idx+1, :]
             peaks = np.maximum.accumulate(paths_subset, axis=0)
             with np.errstate(divide='ignore', invalid='ignore'):
+                # 【量化修正】確保 peak > 0 時才計算回撤，避免淨資產為負時的數學奇異點
                 drawdowns = np.where(peaks > 0, (paths_subset - peaks) / peaks, 0)
             drawdowns = np.clip(drawdowns, -1, 0)
             max_drawdowns = np.min(drawdowns, axis=0)
