@@ -9,7 +9,7 @@ import numpy as np
 # ==========================================
 class LifeFinancialALM:
     """
-    機構級資產負債管理與蒙地卡羅模擬引擎
+    機構級資產負債管理與蒙地卡羅模擬引擎 (經深度量化優化版)
     """
     def __init__(self, params):
         self.p = params
@@ -17,13 +17,14 @@ class LifeFinancialALM:
         self.ages = np.arange(self.p['起始年齡'], 101)
         self.N_paths = self.p.get('模擬路徑數', 1000)
         self.payout_annual = 0.0  # 紀錄勞退年領金額
+        # 【量化修正】將通膨乘數提取為實體屬性，供全域 ALM 計算使用
+        self.inflation_mult = (1 + self.p['通膨率']) ** np.arange(self.N_years)
 
     def generate_base_cashflows(self):
         """產生基礎通膨與現金流，並納入台灣勞退帳戶精算 (純向量化計算)"""
-        inflation_mult = (1 + self.p['通膨率']) ** np.arange(self.N_years)
-        salary = np.where(self.ages <= self.p['退休年齡'], self.p['月薪'] * 12 * inflation_mult, 0)
-        expenses = self.p['月開銷'] * 12 * inflation_mult
-        rent = self.p['月房租'] * 12 * inflation_mult
+        salary = np.where(self.ages <= self.p['退休年齡'], self.p['月薪'] * 12 * self.inflation_mult, 0)
+        expenses = self.p['月開銷'] * 12 * self.inflation_mult
+        rent = self.p['月房租'] * 12 * self.inflation_mult
         
         pension_cf_net = np.zeros(self.N_years)
         idx_retire = max(0, self.p['退休年齡'] - self.p['起始年齡']) if self.p['退休年齡'] in self.ages else 0
@@ -32,7 +33,7 @@ class LifeFinancialALM:
         current_pension = self.p['勞退目前提撥']
         
         if idx_retire > 0:
-            contributions = self.p['勞退每月提撥'] * 12 * inflation_mult[:idx_retire]
+            contributions = self.p['勞退每月提撥'] * 12 * self.inflation_mult[:idx_retire]
             compound_factors = (1 + pension_return) ** np.arange(idx_retire - 1, -1, -1)
             accumulated_contributions = np.sum(contributions * compound_factors)
             current_pension = current_pension * ((1 + pension_return) ** idx_retire) + accumulated_contributions
@@ -54,7 +55,7 @@ class LifeFinancialALM:
             pension_cf_net[idx_retire] = current_pension
 
         net_cashflow_renting = salary - expenses - rent + pension_cf_net
-        return net_cashflow_renting, rent, inflation_mult
+        return net_cashflow_renting, rent, self.inflation_mult
 
     def generate_personal_loan_schedule(self):
         balance = self.p['信貸餘額']
@@ -159,6 +160,10 @@ class LifeFinancialALM:
             property_value[idx_buy:] = self.p['房價'] * appreciation[idx_buy:]
             mortgage_balance[idx_buy:idx_end] = remaining_principal[:loan_length]
 
+            # 【量化修正】導入房產真實持有與折舊成本 (CapEx) 預設年化 0.5% (含稅與修繕)
+            property_holding_costs = property_value * 0.005
+            cf_buying -= property_holding_costs
+
         return cf_renting, cf_buying, property_value, mortgage_balance, yearly_mortgage_pmt, pl_pmt, pl_bal
 
     def simulate_wealth_mc(self, cashflows, is_investing=True):
@@ -172,19 +177,26 @@ class LifeFinancialALM:
         cash_wealth[0, :] = self.p['起始資金'] + cashflows[0]
         wealth[0, :] = inv_wealth[0, :] + cash_wealth[0, :]
         
+        # 【量化修正】投資金額必須隨通膨等比擴張，避免長週期的「購買力幻覺」
         if is_investing:
             Z = np.random.standard_normal((self.N_years, self.N_paths))
             mu = self.p['預期報酬']
             sigma = self.p['預期波動率']
             M = np.exp((mu - (sigma**2)/2) + sigma * Z)
-            annual_inv = self.p['每月投資'] * 12
+            annual_inv_array = self.p['每月投資'] * 12 * self.inflation_mult
         else:
             M = np.ones((self.N_years, self.N_paths))
-            annual_inv = 0.0
+            annual_inv_array = np.zeros(self.N_years)
             
+        # 【量化修正】現金部位若為負，將承擔信貸懲罰利率 (赤字流動性溢價)
+        penalty_rate = self.p.get('信貸利率', 0.03)
+
         for t in range(1, self.N_years):
             prev_inv = inv_wealth[t-1, :]
             prev_cash = cash_wealth[t-1, :]
+            
+            # 懲罰透支：若上期現金為負，自動滾入債息
+            prev_cash = np.where(prev_cash < 0, prev_cash * (1 + penalty_rate), prev_cash)
             
             # 1. 投資部位隨市場波動，現金部位加上當年度收支
             current_inv = prev_inv * M[t, :]
@@ -193,8 +205,8 @@ class LifeFinancialALM:
             total_w = current_inv + current_cash
             
             # 2. 定期定額與自動提領機制 (Rebalancing / SIP)
-            # 期望目標投資額 = 目前市值 + 今年預計投入
-            desired_inv = current_inv + annual_inv
+            # 期望目標投資額 = 目前市值 + 今年預計投入(經通膨校準)
+            desired_inv = current_inv + annual_inv_array[t]
             
             # 向量化動態調整：若總資產 > 0，最多只能投資總資產 (現金不足時自動下修投資部位，等同賣股補貼生活)
             # 若總資產 <= 0 (破產)，投資歸 0，負債由現金部位記帳
@@ -210,17 +222,18 @@ class LifeFinancialALM:
     def run(self):
         cf_rent, cf_buy, prop_val, mort_bal, mort_pmt, pl_pmt, pl_bal = self.build_scenarios()
         
-        # 1. 執行流動性模擬，同時抽取出「實際投資部位市值 (inv_amt)」
-        mc_rent_invest, mc_rent_inv_amt = self.simulate_wealth_mc(cf_rent, is_investing=True)
-        mc_buy_invest, mc_buy_inv_amt = self.simulate_wealth_mc(cf_buy, is_investing=True)
+        # 1. 執行流動性模擬，抽取出「實際投資部位市值 (inv_amt)」與「總流動資產 (total_wealth)」
+        mc_rent_total_wealth, mc_rent_inv_amt = self.simulate_wealth_mc(cf_rent, is_investing=True)
+        mc_buy_total_wealth, mc_buy_inv_amt = self.simulate_wealth_mc(cf_buy, is_investing=True)
         
-        det_rent_no_invest, _ = self.simulate_wealth_mc(cf_rent, is_investing=False)
-        det_buy_no_invest, _ = self.simulate_wealth_mc(cf_buy, is_investing=False)
-        det_rent_no_invest = det_rent_no_invest[:, 0]
-        det_buy_no_invest = det_buy_no_invest[:, 0]
+        det_rent_no_invest_total, _ = self.simulate_wealth_mc(cf_rent, is_investing=False)
+        det_buy_no_invest_total, _ = self.simulate_wealth_mc(cf_buy, is_investing=False)
+        det_rent_no_invest = det_rent_no_invest_total[:, 0]
+        det_buy_no_invest = det_buy_no_invest_total[:, 0]
         
-        mc_rent_net_worth = mc_rent_invest - pl_bal[:, None]
-        mc_buy_net_worth = mc_buy_invest + prop_val[:, None] - mort_bal[:, None] - pl_bal[:, None]
+        # 真實淨資產 = 總流動資產 (現金+投資) + 實體資產 - 負債本金
+        mc_rent_net_worth = mc_rent_total_wealth - pl_bal[:, None]
+        mc_buy_net_worth = mc_buy_total_wealth + prop_val[:, None] - mort_bal[:, None] - pl_bal[:, None]
         
         results = pd.DataFrame(index=self.ages)
         results['年齡'] = self.ages
@@ -245,13 +258,14 @@ class LifeFinancialALM:
         target_age = 65 if 65 in self.ages else self.ages[-1]
         idx_target = np.where(self.ages == target_age)[0][0]
         
+        # 破產定義：生命週期中「總流動資產 (total_wealth) < 0」即視為實質違約
         ruin_probs = {
-            'buy_inv_65': np.mean(np.any(mc_buy_invest[:idx_target+1, :] < 0, axis=0)) * 100,
-            'rent_inv_65': np.mean(np.any(mc_rent_invest[:idx_target+1, :] < 0, axis=0)) * 100,
+            'buy_inv_65': np.mean(np.any(mc_buy_total_wealth[:idx_target+1, :] < 0, axis=0)) * 100,
+            'rent_inv_65': np.mean(np.any(mc_rent_total_wealth[:idx_target+1, :] < 0, axis=0)) * 100,
             'buy_noinv_65': 100.0 if np.any(det_buy_no_invest[:idx_target+1] < 0) else 0.0,
             'rent_noinv_65': 100.0 if np.any(det_rent_no_invest[:idx_target+1] < 0) else 0.0,
-            'rent_inv_end': np.mean(np.any(mc_rent_invest < 0, axis=0)) * 100,
-            'buy_inv_end': np.mean(np.any(mc_buy_invest < 0, axis=0)) * 100
+            'rent_inv_end': np.mean(np.any(mc_rent_total_wealth < 0, axis=0)) * 100,
+            'buy_inv_end': np.mean(np.any(mc_buy_total_wealth < 0, axis=0)) * 100
         }
         
         def calc_median_mdd(net_worth_paths, end_idx):
